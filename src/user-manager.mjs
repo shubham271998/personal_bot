@@ -9,35 +9,23 @@ import fs from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 import crypto from "crypto"
+import { encryptSecure, decryptSecure } from "./security.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const USERS_FILE = path.resolve(__dirname, "../data/users.json")
 
-// Simple encryption for API keys at rest (not bulletproof, but better than plaintext)
-const ENCRYPT_KEY = process.env.USER_ENCRYPT_KEY || "pocket-bot-default-key-change-me!"
-const ALGO = "aes-256-cbc"
+// Encryption master key — MUST be set via env in production
+const MASTER_KEY = process.env.USER_ENCRYPT_KEY || crypto.randomBytes(32).toString("hex")
+if (!process.env.USER_ENCRYPT_KEY) {
+  console.warn("[USER-MGR] ⚠️  USER_ENCRYPT_KEY not set — using random key (API keys won't persist across restarts!)")
+}
 
 function encrypt(text) {
-  const key = crypto.scryptSync(ENCRYPT_KEY, "salt", 32)
-  const iv = crypto.randomBytes(16)
-  const cipher = crypto.createCipheriv(ALGO, key, iv)
-  let encrypted = cipher.update(text, "utf8", "hex")
-  encrypted += cipher.final("hex")
-  return iv.toString("hex") + ":" + encrypted
+  return encryptSecure(text, MASTER_KEY)
 }
 
 function decrypt(text) {
-  try {
-    const [ivHex, encrypted] = text.split(":")
-    const key = crypto.scryptSync(ENCRYPT_KEY, "salt", 32)
-    const iv = Buffer.from(ivHex, "hex")
-    const decipher = crypto.createDecipheriv(ALGO, key, iv)
-    let decrypted = decipher.update(encrypted, "hex", "utf8")
-    decrypted += decipher.final("utf8")
-    return decrypted
-  } catch {
-    return null
-  }
+  return decryptSecure(text, MASTER_KEY)
 }
 
 /**
@@ -203,7 +191,8 @@ class UserManager {
   }
 
   /**
-   * Set admin flag
+   * Set admin flag — ONLY callable internally, never from user commands.
+   * Admin is locked to ALLOWED_TELEGRAM_IDS in .env
    */
   setAdmin(telegramId, isAdmin = true) {
     const user = this.users.get(telegramId)
@@ -214,11 +203,12 @@ class UserManager {
   }
 
   /**
-   * Check if user is admin
+   * Check if user is admin (admins are ONLY from ALLOWED_TELEGRAM_IDS)
    */
   isAdmin(telegramId) {
-    const user = this.users.get(telegramId)
-    return user?.isAdmin || false
+    const allowedIds = (process.env.ALLOWED_TELEGRAM_IDS || "")
+      .split(",").map(Number).filter(Boolean)
+    return allowedIds.includes(telegramId)
   }
 
   /**

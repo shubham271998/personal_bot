@@ -19,7 +19,13 @@ import fs from "fs"
 import { fileURLToPath } from "url"
 import { spawn as spawnProc } from "child_process"
 import { checkRateLimit } from "./src/rate-limiter.mjs"
-import { sanitizeForShell, validateSystemCommand, sanitizePrompt } from "./src/input-sanitizer.mjs"
+import {
+  sanitizeShellArg, isValidSystemCommand, sanitizePrompt,
+  isValidApiKeyFormat, maskSecrets, sanitizeErrorMessage,
+  isMessageTooLarge, generateCallbackToken, validateCallbackToken,
+  canStartSession, incrementSession, decrementSession,
+  isValidProjectPath, recordFailedAttempt, isBlocked,
+} from "./src/security.mjs"
 import userManager from "./src/user-manager.mjs"
 import logger from "./src/logger.mjs"
 import projectManager from "./src/projects.mjs"
@@ -181,7 +187,8 @@ function isAllowed(userId) {
 }
 
 function isAdmin(userId) {
-  return ALLOWED_USER_IDS.includes(userId) || userManager.isAdmin(userId)
+  // Admin is ONLY the owner (from ALLOWED_TELEGRAM_IDS). No one else. Ever.
+  return ALLOWED_USER_IDS.includes(userId)
 }
 
 function splitMessage(text) {
@@ -606,8 +613,9 @@ bot.onText(/\/check\s*(.*)/, async (msg, match) => {
 // ── /logs ───────────────────────────────────────────────────
 bot.onText(/\/logs\s*(.*)/, (msg, match) => {
   const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) { bot.sendMessage(chatId, "⛔ Admin only."); return }
   const category = match[1]?.trim() || "bot"
-  const recent = logger.getRecent(category, 30)
+  const recent = maskSecrets(logger.getRecent(category, 30))
   bot.sendMessage(chatId, `📋 *Recent logs (${category}):*\n\`\`\`\n${recent}\n\`\`\``, {
     parse_mode: "Markdown",
   })
@@ -1072,9 +1080,9 @@ bot.on("message", (msg) => {
 
   awaitingApiKey.delete(chatId)
 
-  // Validate key format
-  if (!key.startsWith("sk-ant-")) {
-    bot.sendMessage(chatId, `❌ That doesn't look like an Anthropic API key.\nIt should start with \`sk-ant-\`.\nTry /setup again.`)
+  // Validate key format (strict)
+  if (!isValidApiKeyFormat(key)) {
+    bot.sendMessage(chatId, `❌ Invalid API key format.\nIt should start with \`sk-ant-\` and be 40+ characters.\nGet one from console.anthropic.com\nTry /setup again.`)
     return
   }
 
@@ -1211,10 +1219,13 @@ bot.onText(/\/blockuser\s+(\d+)/, (msg, match) => {
   }
 })
 
-// ── /sys — Direct system commands (no Claude needed) ────────
+// ── /sys — Direct system commands (admin only) ──────────────
 bot.onText(/\/sys\s*(.*)/, async (msg, match) => {
   const chatId = msg.chat.id
-  if (!isAllowed(msg.from.id)) return
+  if (!isAdmin(msg.from.id)) {
+    bot.sendMessage(chatId, "⛔ System commands are admin-only.")
+    return
+  }
 
   const input = match[1]?.trim()
   if (!input) {
@@ -1243,9 +1254,9 @@ bot.onText(/\/sys\s*(.*)/, async (msg, match) => {
 
   const parts = input.split(/\s+/)
   const command = parts[0]
-  const args = parts.slice(1).map(sanitizeForShell)
+  const args = parts.slice(1).map(sanitizeShellArg)
 
-  if (!validateSystemCommand(command)) {
+  if (!isValidSystemCommand(command)) {
     bot.sendMessage(chatId, `❌ Unknown command: ${command}\nUse /sys for the full list.`)
     return
   }
@@ -1434,9 +1445,24 @@ bot.on("message", async (msg) => {
     return
   }
 
+  if (isBlocked(msg.from.id)) {
+    bot.sendMessage(chatId, "🚫 Too many failed attempts. Try again later.")
+    return
+  }
+
+  if (isMessageTooLarge(userMessage)) {
+    bot.sendMessage(chatId, "⚠️ Message too large. Keep it under 50KB.")
+    return
+  }
+
   const rl = checkRateLimit(msg.from.id)
   if (!rl.allowed) {
     bot.sendMessage(chatId, `⏳ Rate limited. Try again in ${Math.ceil(rl.resetMs / 1000)}s.`)
+    return
+  }
+
+  if (!canStartSession(msg.from.id)) {
+    bot.sendMessage(chatId, "⏳ You have too many concurrent sessions. Wait for one to finish.")
     return
   }
 
@@ -1457,6 +1483,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
     return
   }
 
+  incrementSession(userId)
   bot.sendChatAction(chatId, "typing")
 
   // Send initial status message (will be updated live)
@@ -1577,12 +1604,14 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
     })
 
     logger.info("BOT", `Response sent (${result?.length || 0} chars, ${(durationMs / 1000).toFixed(1)}s)`, { project: projectName, user: userId })
+    decrementSession(userId)
   } catch (err) {
     if (statusUpdateTimer) clearTimeout(statusUpdateTimer)
+    decrementSession(userId)
 
     const durationMs = Date.now() - startTime
     bot.deleteMessage(chatId, statusMsgId).catch(() => {})
-    bot.sendMessage(chatId, `❌ Error: ${err.message}`)
+    bot.sendMessage(chatId, `❌ Error: ${sanitizeErrorMessage(err)}`)
 
     sessionTracker.record({
       chatId,

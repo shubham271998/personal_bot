@@ -350,7 +350,11 @@ export function runClaude({
       }
 
       if (code !== 0 && !finalResult) {
-        reject(new Error(`Claude exited with code ${code}\n${stderr}`))
+        // Strip any API keys or secrets from error output
+        const safeStderr = stderr.replace(/sk-ant-[a-zA-Z0-9_-]+/g, "[REDACTED]")
+          .replace(/ANTHROPIC_API_KEY=[^\s]+/g, "[REDACTED]")
+          .slice(0, 500)
+        reject(new Error(`Claude exited with code ${code}\n${safeStderr}`))
         return
       }
 
