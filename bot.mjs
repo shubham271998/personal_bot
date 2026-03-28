@@ -66,6 +66,7 @@ import {
 } from "./src/security-guard.mjs"
 import { runSystemCommand } from "./src/system-commands.mjs"
 import { registerPolymarketCommands } from "./src/polymarket/telegram-commands.mjs"
+import liveMonitor from "./src/polymarket/live-monitor.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
@@ -193,6 +194,119 @@ function isAdmin(userId) {
 
 // Register Polymarket trading commands
 registerPolymarketCommands(bot, isAdmin)
+
+// Initialize live monitor with bot instance
+if (ownerChatId) {
+  liveMonitor.init(bot, ownerChatId)
+}
+
+// ── /pmstart — Start live monitoring ────────────────────────
+bot.onText(/\/pmstart\s*(\d*)/, (msg, match) => {
+  const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) { bot.sendMessage(chatId, "Admin only."); return }
+
+  const bankroll = parseInt(match[1]) || 100
+  liveMonitor.init(bot, chatId)
+
+  if (liveMonitor.isRunning()) {
+    bot.sendMessage(chatId, "Already monitoring! Use /pmstop to restart.")
+    return
+  }
+
+  liveMonitor.start(bankroll)
+  bot.sendMessage(
+    chatId,
+    `🟢 *Market Monitor Started*\n\n` +
+      `💰 Bankroll: $${bankroll}\n` +
+      `📡 Scanning every 5 minutes\n` +
+      `🔔 Alerts for score ≥ 3 opportunities\n` +
+      `🛡️ Auto-snipe on 96%+ outcomes\n` +
+      `📊 Max ${20} trades/day\n\n` +
+      `I'll message you when I find something good!\n` +
+      `Use /pmstop to pause.`,
+    { parse_mode: "Markdown" },
+  )
+})
+
+// ── /pmstop — Stop monitoring ───────────────────────────────
+bot.onText(/\/pmstop/, (msg) => {
+  const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) return
+
+  if (liveMonitor.stop()) {
+    bot.sendMessage(chatId, "🔴 Market monitor stopped. Use /pmstart to resume.")
+  } else {
+    bot.sendMessage(chatId, "Monitor isn't running.")
+  }
+})
+
+// ── /pmwatch — Add to watchlist ─────────────────────────────
+bot.onText(/\/pmwatch\s+(\d+)\s+(above|below)\s+([\d.]+)/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const marketId = match[1]
+  const direction = match[2]
+  const targetPrice = parseFloat(match[3]) / 100
+
+  try {
+    const { searchMarkets } = await import("./src/polymarket/market-scanner.mjs")
+    const markets = await searchMarkets(marketId, 1)
+    // Use getMarket instead
+    const { getMarket } = await import("./src/polymarket/market-scanner.mjs")
+    const market = await getMarket(marketId)
+
+    if (!market) { bot.sendMessage(chatId, "Market not found."); return }
+
+    const tokenId = market.outcomes[0]?.tokenId
+    if (!tokenId) { bot.sendMessage(chatId, "No token ID."); return }
+
+    liveMonitor.watch(tokenId, market, targetPrice, direction)
+    bot.sendMessage(
+      chatId,
+      `🔔 Watching: *${market.question.slice(0, 60)}*\n` +
+        `Alert when price goes ${direction} ${(targetPrice * 100).toFixed(1)}%`,
+      { parse_mode: "Markdown" },
+    )
+  } catch (err) {
+    bot.sendMessage(chatId, `Failed: ${err.message}`)
+  }
+})
+
+// ── /pmwatchlist — View watchlist ────────────────────────────
+bot.onText(/\/pmwatchlist/, (msg) => {
+  const chatId = msg.chat.id
+  const list = liveMonitor.getWatchlist()
+
+  if (list.length === 0) {
+    bot.sendMessage(chatId, "Watchlist is empty. Use /pmwatch <market_id> above/below <price%>")
+    return
+  }
+
+  const lines = list.map((w) =>
+    `🔔 ${w.market.question.slice(0, 50)}\n   ${w.direction} ${(w.targetPrice * 100).toFixed(1)}% ${w.alertSent ? "(alerted)" : ""}`,
+  )
+
+  bot.sendMessage(chatId, `*Your Watchlist:*\n\n${lines.join("\n\n")}`, { parse_mode: "Markdown" })
+})
+
+// ── /pmrules — Show the "never lose" risk rules ─────────────
+bot.onText(/\/pmrules/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    `🛡️ *Risk Rules (How We Don't Lose Money)*\n\n` +
+      `1. *Max 5% per trade* — Never bet more than 5% of bankroll on one position\n` +
+      `2. *Positive EV only* — Every trade must have a mathematical edge\n` +
+      `3. *Kelly sizing* — Quarter-Kelly for optimal growth with safety\n` +
+      `4. *Max 10% per market* — No over-concentration\n` +
+      `5. *Daily trade limit* — Max 20 trades/day (no overtrading)\n` +
+      `6. *Liquidity check* — Only trade markets with $10K+ daily volume\n` +
+      `7. *Stop losses* — Medium: -15%, High risk: -25%\n` +
+      `8. *Safe first* — 60% capital in resolution snipes + arb (near-guaranteed)\n` +
+      `9. *Auto-snipe* — Anything above 96% is auto-traded (max 4% risk)\n` +
+      `10. *Diversify* — Spread across multiple uncorrelated markets\n\n` +
+      `_"The goal is not to make the most money. It's to never go broke."_`,
+    { parse_mode: "Markdown" },
+  )
+})
 
 function splitMessage(text) {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text]
