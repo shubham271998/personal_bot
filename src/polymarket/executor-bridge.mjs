@@ -1,20 +1,23 @@
 /**
- * Bridge to Python trade executor
- * Calls trade-executor.py for real Polymarket orders (EIP-712 signed)
+ * Bridge to Python trade executor (py-clob-client)
+ * Handles real EIP-712 signed orders on Polymarket CLOB
  */
 import { spawn } from "child_process"
 import path from "path"
 import { fileURLToPath } from "url"
+import { encryptSecure, decryptSecure } from "../security.mjs"
+import db from "../database.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const EXECUTOR_PATH = path.join(__dirname, "trade-executor.py")
+const EXECUTOR = path.join(__dirname, "trade-executor.py")
+const MASTER_KEY = process.env.USER_ENCRYPT_KEY || "default"
 
-function runPython(args) {
+function runPython(args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("python3", [EXECUTOR_PATH, ...args], {
+    const proc = spawn("python3", [EXECUTOR, ...args], {
       env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH}` },
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 30000,
+      timeout,
     })
 
     let stdout = ""
@@ -28,81 +31,111 @@ function runPython(args) {
         if (result.error) reject(new Error(result.error))
         else resolve(result)
       } catch {
-        reject(new Error(stderr || stdout || `Python exited with code ${code}`))
+        reject(new Error(stderr || stdout || `Exit code ${code}`))
       }
     })
     proc.on("error", reject)
   })
 }
 
-/**
- * Place a limit order (GTC)
- */
-export async function placeLimitOrder(tokenId, price, size, side, privateKey) {
-  return runPython([side, tokenId, String(price), String(size), privateKey])
+// ── Wallet Key Management ───────────────────────────────────
+
+export function storeWalletKey(telegramId, privateKey) {
+  const encrypted = encryptSecure(privateKey, MASTER_KEY)
+  db.raw.prepare(`
+    INSERT INTO pm_settings (telegram_id, private_key)
+    VALUES (?, ?)
+    ON CONFLICT(telegram_id) DO UPDATE SET private_key = excluded.private_key
+  `).run(telegramId, encrypted)
 }
 
-/**
- * Place a market order (FOK)
- */
-export async function placeMarketOrder(tokenId, amountUsd, privateKey) {
+export function getWalletKey(telegramId) {
+  const row = db.raw.prepare("SELECT private_key FROM pm_settings WHERE telegram_id = ?").get(telegramId)
+  if (!row?.private_key) return null
+  return decryptSecure(row.private_key, MASTER_KEY)
+}
+
+export function hasWallet(telegramId) {
+  const row = db.raw.prepare("SELECT private_key FROM pm_settings WHERE telegram_id = ?").get(telegramId)
+  return !!row?.private_key
+}
+
+// ── Trading Functions ───────────────────────────────────────
+
+export async function buy(tokenId, price, size, privateKey, negRisk = false) {
+  return runPython(["buy", tokenId, String(price), String(size), privateKey, negRisk ? "true" : "false"])
+}
+
+export async function sell(tokenId, price, size, privateKey, negRisk = false) {
+  return runPython(["sell", tokenId, String(price), String(size), privateKey, negRisk ? "true" : "false"])
+}
+
+export async function marketBuy(tokenId, amountUsd, privateKey) {
   return runPython(["market_buy", tokenId, String(amountUsd), privateKey])
 }
 
-/**
- * Cancel an order
- */
+export async function marketSell(tokenId, amountUsd, privateKey) {
+  return runPython(["market_sell", tokenId, String(amountUsd), privateKey])
+}
+
 export async function cancelOrder(orderId, privateKey) {
   return runPython(["cancel", orderId, privateKey])
 }
 
-/**
- * Cancel all orders
- */
-export async function cancelAllOrders(privateKey) {
+export async function cancelAll(privateKey) {
   return runPython(["cancel_all", privateKey])
 }
 
-/**
- * Get wallet balance (USDC + MATIC)
- */
 export async function getBalance(privateKey) {
   return runPython(["balance", privateKey])
 }
 
-/**
- * Get open positions/orders
- */
-export async function getPositions(privateKey) {
-  return runPython(["positions", privateKey])
+export async function getOpenOrders(privateKey) {
+  return runPython(["open_orders", privateKey])
 }
 
-/**
- * Approve USDC for trading (one-time)
- */
 export async function approveTrading(privateKey) {
-  return runPython(["approve", privateKey])
+  return runPython(["approve", privateKey], 60000) // Longer timeout for on-chain txs
 }
 
+export async function getTickSize(tokenId) {
+  return runPython(["tick_size", tokenId])
+}
+
+// ── High-Level Trade Function ───────────────────────────────
+
 /**
- * Check if py-clob-client is installed
+ * Execute a trade for a user (handles key retrieval, logging)
  */
-export async function checkDependencies() {
-  try {
-    await runPython(["--help"])
-    return true
-  } catch (err) {
-    return err.message.includes("not installed") ? false : true
-  }
+export async function executeTrade(telegramId, { tokenId, price, size, side, marketId, question, outcome, negRisk = false }) {
+  const privateKey = getWalletKey(telegramId)
+  if (!privateKey) throw new Error("No wallet connected. Use /pmconnect first.")
+
+  const tradeFn = side === "BUY" ? buy : sell
+  const result = await tradeFn(tokenId, price, size, privateKey, negRisk)
+
+  // Log to database
+  db.raw.prepare(`
+    INSERT INTO pm_trades (telegram_id, market_id, market_question, outcome, side, price, size_usdc, order_id, status, paper)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'placed', 0)
+  `).run(telegramId, marketId || "", (question || "").slice(0, 200), outcome || "", side, price, size * price, result.order_id || "", )
+
+  return result
 }
 
 export default {
-  placeLimitOrder,
-  placeMarketOrder,
+  storeWalletKey,
+  getWalletKey,
+  hasWallet,
+  buy,
+  sell,
+  marketBuy,
+  marketSell,
   cancelOrder,
-  cancelAllOrders,
+  cancelAll,
   getBalance,
-  getPositions,
+  getOpenOrders,
   approveTrading,
-  checkDependencies,
+  getTickSize,
+  executeTrade,
 }

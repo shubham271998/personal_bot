@@ -400,7 +400,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     }
   })
 
-  // ── /pmwallet — Connect wallet & check balance ────────────
+  // ── /pmwallet — Check wallet balance ────────────────────────
   bot.onText(/\/pmwallet$/, async (msg) => {
     const chatId = msg.chat.id
     if (!isAdminFn(msg.from.id)) {
@@ -408,33 +408,43 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       return
     }
 
-    const settings = trader.getSettings(msg.from.id)
-    if (!settings.private_key) {
+    if (!executor.hasWallet(msg.from.id)) {
       bot.sendMessage(
         chatId,
         `💳 *Connect Your Polygon Wallet*\n\n` +
-          `To trade with real money, I need your Polygon wallet private key.\n\n` +
-          `Use: /pmconnect <private_key>\n\n` +
-          `⚠️ _Make sure this wallet has USDC on Polygon network._\n` +
-          `_Your key is encrypted and stored securely._`,
+          `To trade for real, I need your Polygon wallet private key.\n\n` +
+          `*Setup steps:*\n` +
+          `1. Create a wallet (MetaMask, Rabby, etc.)\n` +
+          `2. Switch to Polygon network\n` +
+          `3. Send some USDC + a tiny bit of MATIC for gas\n` +
+          `4. Export private key and send: /pmconnect <key>\n\n` +
+          `⚠️ _Key is deleted from chat instantly & encrypted._\n` +
+          `_Use a dedicated wallet, not your main one!_`,
         { parse_mode: "Markdown" },
       )
       return
     }
 
+    const loading = await bot.sendMessage(chatId, "💳 _Checking balance..._", { parse_mode: "Markdown" })
     try {
-      const balance = await executor.getBalance(settings.private_key)
-      bot.sendMessage(
-        chatId,
+      const pk = executor.getWalletKey(msg.from.id)
+      const balance = await executor.getBalance(pk)
+      const settings = trader.getSettings(msg.from.id)
+
+      bot.editMessageText(
         `💳 *Your Wallet*\n\n` +
           `Address: \`${balance.address}\`\n` +
           `USDC: *$${balance.usdc.toFixed(2)}*\n` +
-          `MATIC: ${balance.matic.toFixed(4)}\n\n` +
-          `Mode: ${settings.paper_mode ? "📝 Paper" : "💰 Live"}`,
-        { parse_mode: "Markdown" },
+          `MATIC: ${balance.matic.toFixed(4)} (for gas)\n\n` +
+          `Mode: ${settings.paper_mode ? "📝 Paper" : "💰 Live"}\n\n` +
+          `_/pmapprove to approve USDC for trading (one-time)_\n` +
+          `_/pmset paper off to switch to live mode_`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
       )
     } catch (err) {
-      bot.sendMessage(chatId, `Wallet check failed: ${err.message}`)
+      bot.editMessageText(`Wallet check failed: ${err.message}`, {
+        chat_id: chatId, message_id: loading.message_id,
+      })
     }
   })
 
@@ -443,31 +453,119 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     const chatId = msg.chat.id
     if (!isAdminFn(msg.from.id)) return
 
-    // Delete the message with the key immediately
+    // Delete the message with the key IMMEDIATELY
     bot.deleteMessage(chatId, msg.message_id).catch(() => {})
 
     const key = match[1].trim()
     if (!key.startsWith("0x") || key.length !== 66) {
-      bot.sendMessage(chatId, "Invalid private key format. Should be 0x + 64 hex characters.")
+      bot.sendMessage(chatId, "Invalid key format. Should be 0x + 64 hex characters.\nMake sure to export the *private key*, not the address.")
       return
     }
 
+    const loading = await bot.sendMessage(chatId, "🔄 _Connecting wallet..._", { parse_mode: "Markdown" })
+
     try {
       const balance = await executor.getBalance(key)
-      trader.updateSettings(msg.from.id, { privateKey: key })
 
-      bot.sendMessage(
-        chatId,
+      // Store encrypted key
+      executor.storeWalletKey(msg.from.id, key)
+      trader.updateSettings(msg.from.id, { privateKey: "stored_in_executor" })
+
+      bot.editMessageText(
         `✅ *Wallet Connected!*\n\n` +
           `Address: \`${balance.address}\`\n` +
           `USDC: $${balance.usdc.toFixed(2)}\n` +
           `MATIC: ${balance.matic.toFixed(4)}\n\n` +
-          `_Key deleted from chat & encrypted._\n` +
-          `Use /pmset paper off to enable live trading.`,
-        { parse_mode: "Markdown" },
+          `*Next steps:*\n` +
+          `1. /pmapprove — Approve USDC for trading (one-time, costs ~0.01 MATIC)\n` +
+          `2. /pmset paper off — Switch to live mode\n` +
+          `3. Start trading!\n\n` +
+          `_Key deleted from chat & encrypted in database._`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
       )
     } catch (err) {
-      bot.sendMessage(chatId, `Couldn't connect wallet: ${err.message}`)
+      bot.editMessageText(`Couldn't connect: ${err.message}`, {
+        chat_id: chatId, message_id: loading.message_id,
+      })
+    }
+  })
+
+  // ── /pmapprove — Approve USDC spending on Polymarket ──────
+  bot.onText(/\/pmapprove/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    const pk = executor.getWalletKey(msg.from.id)
+    if (!pk) {
+      bot.sendMessage(chatId, "Connect wallet first: /pmconnect <private_key>")
+      return
+    }
+
+    const loading = await bot.sendMessage(
+      chatId,
+      "🔄 _Approving USDC for 3 Polymarket exchange contracts..._\n_This sends 3 on-chain transactions (costs ~0.03 MATIC)_",
+      { parse_mode: "Markdown" },
+    )
+
+    try {
+      const result = await executor.approveTrading(pk)
+
+      bot.editMessageText(
+        `✅ *USDC Approved for Trading!*\n\n` +
+          `Approved ${result.exchanges} exchange contracts:\n` +
+          `• CTF Exchange (binary markets)\n` +
+          `• NegRisk Exchange (multi-outcome)\n` +
+          `• NegRisk Adapter\n\n` +
+          `You're ready to trade! Use /pmset paper off to go live.`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.editMessageText(`Approval failed: ${err.message}\n\nMake sure you have MATIC for gas fees.`, {
+        chat_id: chatId, message_id: loading.message_id,
+      })
+    }
+  })
+
+  // ── /pmorders — View open orders on-chain ─────────────────
+  bot.onText(/\/pmorders/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    const pk = executor.getWalletKey(msg.from.id)
+    if (!pk) { bot.sendMessage(chatId, "No wallet. /pmconnect first."); return }
+
+    try {
+      const result = await executor.getOpenOrders(pk)
+      const orders = result.orders || []
+
+      if (orders.length === 0) {
+        bot.sendMessage(chatId, "No open orders on Polymarket right now.")
+        return
+      }
+
+      const lines = orders.slice(0, 10).map((o, i) =>
+        `${i + 1}. ${o.side} @ ${o.price} — ${o.size} shares\n   ID: \`${(o.id || "").slice(0, 12)}...\``,
+      )
+
+      bot.sendMessage(chatId, `📋 *Open Orders (${orders.length})*\n\n${lines.join("\n\n")}`, { parse_mode: "Markdown" })
+    } catch (err) {
+      bot.sendMessage(chatId, `Failed: ${err.message}`)
+    }
+  })
+
+  // ── /pmcancelall — Cancel all open orders ─────────────────
+  bot.onText(/\/pmcancelall/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    const pk = executor.getWalletKey(msg.from.id)
+    if (!pk) { bot.sendMessage(chatId, "No wallet."); return }
+
+    try {
+      await executor.cancelAll(pk)
+      bot.sendMessage(chatId, "✅ All open orders cancelled.")
+    } catch (err) {
+      bot.sendMessage(chatId, `Cancel failed: ${err.message}`)
     }
   })
 
