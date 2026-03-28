@@ -71,6 +71,8 @@ import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 import selfImprover from "./src/polymarket/self-improver.mjs"
 import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
 import smartBrain from "./src/polymarket/smart-brain.mjs"
+import cloudDb from "./src/cloud-db.mjs"
+import db from "./src/database.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 // BOT_ROLE: "trading" = prediction markets only (cloud), "coding" = Claude + system (local)
@@ -233,6 +235,21 @@ function isAdmin(userId) {
 // Only register Polymarket commands on trading bot
 if (IS_TRADING_BOT) {
   registerPolymarketCommands(bot, isAdmin)
+}
+
+// ── Cloud DB: permanent memory that survives everything ─────
+if (cloudDb.init()) {
+  cloudDb.setupTables().then(() => {
+    // Pull latest learning from cloud on startup
+    cloudDb.pullFromCloud(db.raw).then(({ pulled }) => {
+      if (pulled > 0) console.log(`[CLOUD-DB] Restored ${pulled} records from cloud`)
+    })
+  })
+
+  // Sync local → cloud every 5 minutes
+  setInterval(() => {
+    cloudDb.syncToCloud(db.raw).catch(() => {})
+  }, 5 * 60 * 1000)
 }
 
 // AUTO-START based on role
