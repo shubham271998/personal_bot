@@ -824,6 +824,15 @@ export function startAutonomous() {
   if (_isRunning) return false
   _isRunning = true
 
+  // Load existing open positions into dedup set (persist across restarts)
+  try {
+    const openPositions = virtualStmts.getOpenPositions.all()
+    for (const pos of openPositions) {
+      if (pos.market_id) _tradedMarkets.add(pos.market_id)
+    }
+    console.log(`[AUTO-ANALYST] Loaded ${openPositions.length} open positions into dedup set`)
+  } catch {}
+
   console.log("[AUTO-ANALYST] Started autonomous mode with virtual trading")
 
   // Initial briefing after 30 seconds
