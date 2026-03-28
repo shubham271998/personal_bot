@@ -519,8 +519,12 @@ const virtualStmts = {
 }
 
 const VIRTUAL_BANKROLL = 1000
-const VIRTUAL_MAX_BET = 30 // $30 max per trade (smaller bets, more learning)
-const VIRTUAL_MAX_OPEN = 20 // Max 20 open positions (more data points)
+const VIRTUAL_MAX_BET = 25 // $25 max per trade
+const VIRTUAL_MAX_OPEN = 30 // 30 open positions — more data = faster learning
+
+// ⚠️ NEVER DELETE DATA — the DB is the bot's memory and brain.
+// Every trade, prediction, lesson, and mistake is permanent.
+// This is how the bot gets smarter over weeks/months.
 
 /**
  * Auto-trade based on scan results — bot decides and executes virtually
@@ -692,10 +696,10 @@ async function checkVirtualPositions() {
         closeReason = "expired-worthless"
       }
 
-      // 6. Stale positions: open for >7 days with no movement → close
+      // 6. Stale positions: close sooner to free up capital for new learning
       if (!shouldClose) {
         const ageHours = (Date.now() - new Date(pos.created_at).getTime()) / 3600000
-        if (ageHours > 168) { // 7 days
+        if (ageHours > 72) { // 3 days (was 7) — faster capital recycling
           shouldClose = true
           closeReason = "stale (7+ days)"
         }

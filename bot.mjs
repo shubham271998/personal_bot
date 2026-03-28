@@ -73,8 +73,12 @@ import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
 import smartBrain from "./src/polymarket/smart-brain.mjs"
 
 // ── Config ──────────────────────────────────────────────────
-const BOT_MODE = process.env.BOT_MODE || (process.platform === "darwin" ? "🏠 Local" : "☁️ Cloud")
-const BOT_TAG = BOT_MODE === "☁️ Cloud" ? "☁️" : "🏠"
+// BOT_ROLE: "trading" = prediction markets only (cloud), "coding" = Claude + system (local)
+const BOT_ROLE = process.env.BOT_ROLE || (process.platform === "darwin" ? "coding" : "trading")
+const IS_TRADING_BOT = BOT_ROLE === "trading"
+const IS_CODING_BOT = BOT_ROLE === "coding"
+const BOT_MODE = IS_CODING_BOT ? "🏠 Local" : "☁️ Cloud"
+const BOT_TAG = IS_CODING_BOT ? "🏠" : "☁️"
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!BOT_TOKEN) {
   logger.error("BOT", "Set TELEGRAM_BOT_TOKEN env variable")
@@ -226,31 +230,38 @@ function isAdmin(userId) {
 }
 
 // Register Polymarket trading commands
-registerPolymarketCommands(bot, isAdmin)
+// Only register Polymarket commands on trading bot
+if (IS_TRADING_BOT) {
+  registerPolymarketCommands(bot, isAdmin)
+}
 
-// Initialize and AUTO-START live monitor + auto-analyst on boot
-if (ownerChatId) {
+// AUTO-START based on role
+if (ownerChatId && IS_TRADING_BOT) {
+  // ☁️ TRADING BOT: Auto-start prediction market monitoring
   liveMonitor.init(bot, ownerChatId)
   autoAnalyst.init(bot, ownerChatId)
 
-  // Auto-start everything — no need to /pmstart manually
   setTimeout(async () => {
     try {
       liveMonitor.start(1000)
       autoAnalyst.startAutonomous()
       console.log("[PM] Auto-started: monitor + analyst + virtual trading ($1000 bankroll)")
       bot.sendMessage(ownerChatId,
-        `📈 *Markets are live!*\n\n` +
+        `☁️ *Trading Bot Online*\n\n` +
           `Auto-started with $1000 virtual bankroll.\n` +
-          `Scanning, trading, and evaluating 24/7.\n\n` +
-          `/pmscorecard — see my virtual P&L\n` +
-          `/pmeval — my prediction accuracy`,
+          `Scanning, trading, and learning 24/7.\n\n` +
+          `/pmscorecard — virtual P&L\n` +
+          `/pmbrain — my thinking\n` +
+          `/pmlearn — what I've learned`,
         { parse_mode: "Markdown" },
       ).catch(() => {})
     } catch (err) {
       console.error("[PM] Auto-start failed:", err.message)
     }
-  }, 15000) // Wait 15s for bot to fully initialize
+  }, 15000)
+} else if (ownerChatId && IS_CODING_BOT) {
+  // 🏠 CODING BOT: Just notify it's online
+  console.log("[LOCAL] Coding bot started — Claude + system control ready")
 }
 
 // ── /pmstart — Start live monitoring ────────────────────────
@@ -592,22 +603,43 @@ bot.onText(/\/start/, (msg) => {
     ? `✅ You're all set up!`
     : `👋 Use /setup to connect your account and get started`
 
-  bot.sendMessage(
-    chatId,
-    `Hey ${name}! 👋 ${BOT_MODE}\n\n` +
-      `I'm your personal assistant — ask me anything, send voice notes, or control your system right from here.\n\n` +
-      `${statusLine}\n` +
-      (project ? `📁 Working on: *${project.name}*\n\n` : "\n") +
-      `*Here's what I can do:*\n\n` +
-      `💬 *Chat* — Just type or send a voice message\n` +
-      `💻 *Code* — /review, /diff, /explain, /check\n` +
-      `🎵 *Music* — "Play Arijit Singh on Spotify"\n` +
-      `🖥️ *System* — /sys sleep, volume, battery...\n` +
-      `🛡️ *Security* — /guardstart to watch your laptop\n` +
-      `📊 *Stats* — /myusage to track your spending\n\n` +
-      `_Just talk to me like you would to a friend!_ ✨`,
-    { parse_mode: "Markdown" },
-  )
+  if (IS_TRADING_BOT) {
+    bot.sendMessage(
+      chatId,
+      `Hey ${name}! 👋 ☁️ Trading Bot\n\n` +
+        `I'm your prediction market trader — running 24/7 on the cloud.\n\n` +
+        `*What I do:*\n` +
+        `📈 Scan 80+ markets every 5 minutes\n` +
+        `🧠 7-check smart brain for every trade\n` +
+        `💰 Virtual trading to learn (real money when ready)\n` +
+        `📊 Self-evaluation and improvement\n\n` +
+        `*Commands:*\n` +
+        `/pmbrain — See my thinking on current markets\n` +
+        `/pmscorecard — Virtual P&L and stats\n` +
+        `/pmlearn — What I've learned from mistakes\n` +
+        `/pmtop — Trending markets\n` +
+        `/pmscan — Full strategy scan\n` +
+        `/pmwallet — Connect wallet for real trading\n\n` +
+        `_I'm learning every day. Once profitable, we go live!_ 🚀`,
+      { parse_mode: "Markdown" },
+    )
+  } else {
+    bot.sendMessage(
+      chatId,
+      `Hey ${name}! 👋 🏠 Local Assistant\n\n` +
+        `I'm your personal coding & system assistant.\n\n` +
+        `${statusLine}\n` +
+        (project ? `📁 Working on: *${project.name}*\n\n` : "\n") +
+        `*What I can do:*\n` +
+        `💬 Chat — Just type or send a voice message\n` +
+        `💻 Code — /review, /diff, /explain, /check\n` +
+        `🎵 Music — "Play Arijit Singh on Spotify"\n` +
+        `🖥️ System — /sys sleep, volume, battery...\n` +
+        `🛡️ Security — /guardstart to watch your laptop\n\n` +
+        `_Just talk to me like you would to a friend!_ ✨`,
+      { parse_mode: "Markdown" },
+    )
+  }
 })
 
 // ── /cancel ─────────────────────────────────────────────────
@@ -1852,7 +1884,21 @@ bot.on("message", async (msg) => {
     return
   }
 
-  await handleClaudeQuery(chatId, sanitizePrompt(userMessage))
+  if (IS_TRADING_BOT) {
+    // ☁️ Trading bot: treat messages as market questions, not Claude queries
+    const name = msg.from.first_name || "there"
+    bot.sendMessage(chatId,
+      `Hey ${name}! I'm your trading assistant ☁️\n\n` +
+        `Try:\n` +
+        `/pmbrain — Smart market scan\n` +
+        `/pmscorecard — My virtual P&L\n` +
+        `/pmsearch ${userMessage.slice(0, 30)} — Search for this market\n` +
+        `/pmlearn — What I've learned`,
+    )
+  } else {
+    // 🏠 Coding bot: send to Claude
+    await handleClaudeQuery(chatId, sanitizePrompt(userMessage))
+  }
 })
 
 // ── Core Claude query handler (with live streaming updates) ──

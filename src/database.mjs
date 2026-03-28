@@ -1,6 +1,11 @@
 /**
  * Database — SQLite persistence for users, sessions, and usage
  *
+ * ⚠️  SACRED RULE: NEVER DELETE LEARNING DATA.
+ * The bot's intelligence comes from accumulated experience.
+ * Every trade, prediction, lesson, mistake, and evaluation is PERMANENT.
+ * Clearing the DB = erasing the bot's brain = starting from zero.
+ *
  * Tables:
  *   users        — registration, auth, admin status
  *   api_keys     — encrypted API keys (separate for security)
@@ -264,7 +269,38 @@ export default {
   // Raw db access for migrations
   raw: db,
 
+  // Auto-backup the brain every 6 hours
+  backup() {
+    try {
+      const backupPath = path.join(DB_DIR, `bot-backup-${new Date().toISOString().split("T")[0]}.db`)
+      db.backup(backupPath).then(() => {
+        console.log(`[DB] Brain backed up to ${backupPath}`)
+      }).catch(() => {})
+    } catch {}
+  },
+
+  // Get DB stats
+  stats() {
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()
+    const stats = {}
+    for (const { name } of tables) {
+      try {
+        const count = db.prepare(`SELECT COUNT(*) as c FROM ${name}`).get()
+        stats[name] = count.c
+      } catch {}
+    }
+    return stats
+  },
+
   close() {
     db.close()
   },
 }
+
+// Auto-backup every 6 hours
+setInterval(() => {
+  try {
+    const backupPath = path.join(DB_DIR, `bot-backup-${new Date().toISOString().split("T")[0]}.db`)
+    db.backup(backupPath).then(() => console.log("[DB] Auto-backup complete")).catch(() => {})
+  } catch {}
+}, 6 * 60 * 60 * 1000)

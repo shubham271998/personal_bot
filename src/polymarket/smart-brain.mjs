@@ -273,10 +273,18 @@ export async function evaluateMarket(market, bankroll = 1000) {
 
   result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
 
-  if (isVirtual && !result.shouldTrade && realEdge > 0.01) {
-    // In virtual mode, also take small-edge bets to LEARN which work
-    result.shouldTrade = true
-    result.reasoning.push("Learning trade — small edge, taking it to gather data")
+  if (isVirtual && !result.shouldTrade) {
+    // In virtual mode, take diverse bets to LEARN which patterns work
+    // The more data we collect, the faster the bot gets smart
+    if (realEdge > 0.01) {
+      result.shouldTrade = true
+      result.reasoning.push("📚 Learning trade — gathering data on this pattern")
+    } else if (checksPassesd >= 2 && market.volume24hr >= SWEET_SPOT_MIN) {
+      // Even without clear edge, take tiny bets on interesting markets to learn
+      result.shouldTrade = true
+      result.betSize = 2 // Minimum bet — pure learning
+      result.reasoning.push("📚 Exploration bet ($2) — testing if this market type is predictable")
+    }
   }
   result.confidence = checksPassesd / totalChecks
   result.score = realEdge * 100 * result.confidence
