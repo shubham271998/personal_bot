@@ -68,6 +68,7 @@ import { runSystemCommand } from "./src/system-commands.mjs"
 import { registerPolymarketCommands } from "./src/polymarket/telegram-commands.mjs"
 import liveMonitor from "./src/polymarket/live-monitor.mjs"
 import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
+import selfImprover from "./src/polymarket/self-improver.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_MODE = process.env.BOT_MODE || (process.platform === "darwin" ? "🏠 Local" : "☁️ Cloud")
@@ -154,6 +155,8 @@ bot.setMyCommands([
   { command: "pmhistory", description: "Trade log" },
   { command: "pmscorecard", description: "Virtual trading P&L scorecard" },
   { command: "pmeval", description: "My prediction accuracy" },
+  { command: "pmreport", description: "Full self-improvement report" },
+  { command: "pmwhale", description: "Whale activity on a market" },
   { command: "pmauto", description: "Auto-watchlist" },
   { command: "pmbriefing", description: "Market briefing now" },
   { command: "pmwallet", description: "Check wallet balance" },
@@ -373,7 +376,59 @@ bot.onText(/\/pmscorecard/, (msg) => {
 bot.onText(/\/pmeval/, (msg) => {
   const chatId = msg.chat.id
   const report = autoAnalyst.getEvalReport()
-  bot.sendMessage(chatId, report.text, { parse_mode: "Markdown" })
+  bot.sendMessage(chatId, report.text, { parse_mode: "Markdown" }).catch(() =>
+    bot.sendMessage(chatId, report.text.replace(/[*_`\[\]\\]/g, "")),
+  )
+})
+
+// ── /pmreport — Full self-improvement report (Brier, calibration, lessons)
+bot.onText(/\/pmreport/, (msg) => {
+  const chatId = msg.chat.id
+  try {
+    const report = selfImprover.generateImprovementReport()
+    bot.sendMessage(chatId, report, { parse_mode: "Markdown" }).catch(() =>
+      bot.sendMessage(chatId, report.replace(/[*_`\[\]\\]/g, "")),
+    )
+  } catch (err) {
+    bot.sendMessage(chatId, `Report failed: ${err.message}`)
+  }
+})
+
+// ── /pmwhale — Check whale activity on a market ─────────────
+bot.onText(/\/pmwhale\s+(.+)/, async (msg, match) => {
+  const chatId = msg.chat.id
+  const query = match[1].trim()
+
+  try {
+    const { searchMarkets } = await import("./src/polymarket/market-scanner.mjs")
+    const markets = await searchMarkets(query, 1)
+    if (!markets.length || !markets[0].outcomes[0]?.tokenId) {
+      bot.sendMessage(chatId, "Market not found or no token ID.")
+      return
+    }
+
+    const market = markets[0]
+    const whale = await selfImprover.detectWhaleActivity(market.outcomes[0].tokenId)
+    if (!whale) {
+      bot.sendMessage(chatId, "Couldn't check whale activity.")
+      return
+    }
+
+    const emoji = whale.whaleDirection === "BULLISH" ? "🟢" : whale.whaleDirection === "BEARISH" ? "🔴" : "⚪"
+
+    bot.sendMessage(
+      chatId,
+      `🐋 *Whale Activity: ${market.question.slice(0, 50)}*\n\n` +
+        `${emoji} Direction: *${whale.whaleDirection}*\n` +
+        `Large bids: ${whale.largeBids} ($${(whale.buyPressure / 1000).toFixed(0)}K)\n` +
+        `Large asks: ${whale.largeAsks} ($${(whale.sellPressure / 1000).toFixed(0)}K)\n` +
+        `Buy/Sell ratio: ${(whale.ratio * 100).toFixed(0)}%/${((1 - whale.ratio) * 100).toFixed(0)}%\n\n` +
+        `_Large = orders > $50K_`,
+      { parse_mode: "Markdown" },
+    ).catch(() => {})
+  } catch (err) {
+    bot.sendMessage(chatId, `Failed: ${err.message}`)
+  }
 })
 
 // ── /pmauto — See auto-managed watchlist ────────────────────

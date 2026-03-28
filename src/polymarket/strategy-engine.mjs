@@ -23,6 +23,7 @@
 import scanner from "./market-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import negRiskScanner from "./negrisk-scanner.mjs"
+import selfImprover from "./self-improver.mjs"
 
 // ── Pro Rules (from $85M+ in proven trader research) ────────
 // Rule: NEVER trade in the $0.51-$0.67 range (where most losses cluster)
@@ -152,20 +153,38 @@ export async function findNewsAlpha(topN = 20) {
       const sentiment = newsAnalyzer.analyzeSentiment(headlines, market.outcomes[0].name)
       const yesPrice = market.outcomes[0].price
 
+      // Check whale activity for extra signal
+      let whaleBoost = 0
+      let whaleInfo = ""
+      try {
+        const tokenId = market.outcomes[0].tokenId
+        if (tokenId) {
+          const whale = await selfImprover.detectWhaleActivity(tokenId)
+          if (whale) {
+            if (whale.whaleDirection === "BULLISH" && whale.ratio > 0.7) { whaleBoost = 0.1; whaleInfo = " + whales buying" }
+            if (whale.whaleDirection === "BEARISH" && whale.ratio < 0.3) { whaleBoost = -0.1; whaleInfo = " + whales selling" }
+          }
+        }
+      } catch {}
+
+      // Apply Tetlock's extremization to our estimate
+      const rawEstimate = sentiment.bullishPct + whaleBoost
+      const extremized = selfImprover.extremize(rawEstimate, 1.3)
+
       // Strong bullish news but low market price → BUY YES
-      if (sentiment.bullishPct > 0.6 && yesPrice < 0.4) {
-        const edge = sentiment.bullishPct - yesPrice
+      if (extremized > 0.55 && yesPrice < 0.4) {
+        const edge = extremized - yesPrice
         alphas.push({
           market,
           direction: "BUY_YES",
           outcome: market.outcomes[0].name,
           currentPrice: yesPrice,
-          estimatedProb: sentiment.bullishPct,
+          estimatedProb: extremized,
           edge: edge,
           risk: "MEDIUM",
           strategy: "News Alpha",
           score: edge * 10 * (market.volume24hr > 100000 ? 1.5 : 1),
-          reasoning: `News is ${(sentiment.bullishPct * 100).toFixed(0)}% bullish but market at ${(yesPrice * 100).toFixed(0)}% — ${(edge * 100).toFixed(0)}% edge`,
+          reasoning: `News ${(sentiment.bullishPct * 100).toFixed(0)}% bullish${whaleInfo}, extremized to ${(extremized * 100).toFixed(0)}% vs market ${(yesPrice * 100).toFixed(0)}%`,
           headlines: sentiment.headlines.slice(0, 3).map((h) => h.title),
         })
       }
