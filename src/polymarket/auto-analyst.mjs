@@ -15,6 +15,34 @@ import strategyEngine from "./strategy-engine.mjs"
 import selfImprover from "./self-improver.mjs"
 import db from "../database.mjs"
 
+// ── Deduplication — track what we've already notified/traded ─
+const _notifiedMarkets = new Map()  // marketId -> timestamp (last notified)
+const _tradedMarkets = new Set()    // marketId (already have a position)
+const NOTIFY_COOLDOWN_MS = 4 * 60 * 60 * 1000  // Don't re-notify same market for 4 hours
+const PREDICTION_COOLDOWN_MS = 2 * 60 * 60 * 1000  // Don't re-predict same market for 2 hours
+const _predictedMarkets = new Map() // marketId -> timestamp
+
+function shouldNotify(marketId) {
+  const last = _notifiedMarkets.get(marketId)
+  if (last && Date.now() - last < NOTIFY_COOLDOWN_MS) return false
+  _notifiedMarkets.set(marketId, Date.now())
+  return true
+}
+
+function shouldPredict(marketId) {
+  const last = _predictedMarkets.get(marketId)
+  if (last && Date.now() - last < PREDICTION_COOLDOWN_MS) return false
+  _predictedMarkets.set(marketId, Date.now())
+  return true
+}
+
+// Cleanup old entries every hour
+setInterval(() => {
+  const cutoff = Date.now() - NOTIFY_COOLDOWN_MS * 2
+  for (const [k, v] of _notifiedMarkets) { if (v < cutoff) _notifiedMarkets.delete(k) }
+  for (const [k, v] of _predictedMarkets) { if (v < cutoff) _predictedMarkets.delete(k) }
+}, 3600000)
+
 // ── Safe Telegram sender (handles markdown errors) ──────────
 function escapeMarkdown(text) {
   if (!text) return ""
@@ -522,8 +550,11 @@ async function autoVirtualTrade(scanResults) {
     if (pick.score < 0.5) continue
     if (!pick.market?.id) continue
 
-    // Don't double up on same market
-    if (openPositions.some((p) => p.market_id === pick.market.id)) continue
+    // Don't double up on same market (check DB + in-memory)
+    const mId = pick.market?.id || pick.event?.eventId || ""
+    if (!mId) continue
+    if (openPositions.some((p) => p.market_id === mId)) continue
+    if (_tradedMarkets.has(mId)) continue
 
     // Calculate bet size with drawdown + time adjustments
     let baseBet = Math.max(5, Math.min(pick.betSize || 10, VIRTUAL_MAX_BET, availableCapital * 0.1))
@@ -560,6 +591,7 @@ async function autoVirtualTrade(scanResults) {
         pick.strategy || "Auto",
       )
       tradesPlaced++
+      _tradedMarkets.add(marketId)
       console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy})`)
     } catch (err) {
       console.error(`[VIRTUAL] Trade failed:`, err.message)
@@ -578,41 +610,59 @@ async function checkVirtualPositions() {
 
   for (const pos of openPositions) {
     try {
-      const market = await scanner.getMarket(pos.market_id)
-
-      // If market not found or errored, skip (don't close)
-      if (!market) continue
-
-      // Find current price for our outcome
+      let market = null
       let currentPrice = pos.entry_price
-      if (market.outcomes) {
-        const match = market.outcomes.find((o) =>
-          o.name.toLowerCase().includes(pos.outcome.toLowerCase()),
-        )
-        if (match) currentPrice = match.price
+      let marketClosed = false
+
+      try {
+        market = await scanner.getMarket(pos.market_id)
+      } catch {}
+
+      if (market) {
+        marketClosed = !market.active
+        if (market.outcomes) {
+          // Try exact match first, then partial
+          const match = market.outcomes.find((o) => o.name === pos.outcome) ||
+            market.outcomes.find((o) => o.name.toLowerCase().includes(pos.outcome.toLowerCase())) ||
+            market.outcomes[0]
+          if (match) currentPrice = match.price
+        }
       }
 
       let shouldClose = false
       let closeReason = ""
 
-      // 1. Market resolved → close with final price
-      if (!market.active) {
-        currentPrice = currentPrice >= 0.99 ? 1.0 : currentPrice <= 0.01 ? 0.0 : currentPrice
-        shouldClose = true
-        closeReason = "resolved"
+      // 1. Market resolved or closed
+      if (marketClosed || (!market && pos.created_at)) {
+        // If market not found after 24h, assume resolved
+        const ageHours = (Date.now() - new Date(pos.created_at).getTime()) / 3600000
+        if (marketClosed || ageHours > 24) {
+          if (currentPrice >= 0.95) currentPrice = 1.0
+          else if (currentPrice <= 0.05) currentPrice = 0.0
+          shouldClose = true
+          closeReason = "resolved"
+        }
       }
 
-      // 2. Take profit: price moved +20% from entry → lock in gains
-      if (!shouldClose && currentPrice >= pos.entry_price * 1.20 && pos.strategy !== "Resolution Snipe") {
-        shouldClose = true
-        closeReason = "take-profit (+20%)"
+      // 2. Resolution snipe: price near 100% or market closed
+      if (!shouldClose && pos.strategy === "Resolution Snipe") {
+        if (currentPrice >= 0.98) {
+          currentPrice = 1.0
+          shouldClose = true
+          closeReason = "snipe-won"
+        } else if (currentPrice < pos.entry_price * 0.90) {
+          // Snipe went wrong — cut loss
+          shouldClose = true
+          closeReason = "snipe-failed"
+        }
       }
 
-      // 3. Resolution snipe: price hit 99%+ → take the guaranteed money
-      if (!shouldClose && pos.strategy === "Resolution Snipe" && currentPrice >= 0.99) {
-        currentPrice = 1.0
-        shouldClose = true
-        closeReason = "snipe-resolved"
+      // 3. Take profit: price moved +15% from entry
+      if (!shouldClose && pos.strategy !== "Resolution Snipe") {
+        if (currentPrice >= pos.entry_price + 0.15) {
+          shouldClose = true
+          closeReason = "take-profit"
+        }
       }
 
       // 4. Stop loss: -30% for risky, -15% for medium
@@ -797,19 +847,7 @@ async function sendBriefing() {
     const briefing = await generateBriefing()
     await safeSend(_bot, _chatId, briefing)
 
-    // Record predictions from the scan
-    const scan = await strategyEngine.runFullScan(100)
-    for (const pick of scan.topPicks.slice(0, 5)) {
-      if (pick.market?.id) {
-        const outcome = pick.outcome || pick.market.outcomes?.[0]?.name || "YES"
-        const prob = pick.estimatedProb || pick.price || 0.5
-        recordPrediction(
-          pick.market.id, pick.market.question?.slice(0, 200) || "",
-          outcome, prob, pick.currentPrice || pick.price || 0.5,
-          pick.score / 10, pick.reasoning?.slice(0, 300) || "",
-        )
-      }
-    }
+    // Predictions are now recorded in runVirtualTradingCycle (deduplicated)
   } catch (err) {
     console.error("[AUTO-ANALYST] Briefing error:", err.message)
   }
@@ -900,14 +938,13 @@ async function runVirtualTradingCycle() {
       )
     }
 
-    // 3. Record predictions for picks (with real prices)
-    for (const pick of scan.topPicks.slice(0, 5)) {
+    // 3. Record predictions (deduplicated — max 1 per market per 2 hours)
+    for (const pick of scan.topPicks.slice(0, 3)) {
       const mId = pick.market?.id || pick.event?.eventId
-      if (!mId) continue
+      if (!mId || !shouldPredict(mId)) continue
 
       const outcome = pick.outcome || pick.market?.outcomes?.[0]?.name || "YES"
       const marketPrice = pick.currentPrice || pick.price || pick.market?.outcomes?.[0]?.price || 0.5
-      // Our estimated probability: if we're buying, we think it's higher than market
       const estimatedProb = pick.estimatedProb || (pick.direction === "BUY_YES" ? Math.min(0.95, marketPrice + 0.15) : marketPrice)
       const question = pick.market?.question || pick.event?.title || ""
 
