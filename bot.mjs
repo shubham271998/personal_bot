@@ -65,6 +65,7 @@ import {
   REFERENCE_SCREEN,
 } from "./src/security-guard.mjs"
 import { runSystemCommand } from "./src/system-commands.mjs"
+import { registerPolymarketCommands } from "./src/polymarket/telegram-commands.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
@@ -189,6 +190,9 @@ function isAdmin(userId) {
   // Admin is ONLY the owner (from ALLOWED_TELEGRAM_IDS). No one else. Ever.
   return ALLOWED_USER_IDS.includes(userId)
 }
+
+// Register Polymarket trading commands
+registerPolymarketCommands(bot, isAdmin)
 
 function splitMessage(text) {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text]
