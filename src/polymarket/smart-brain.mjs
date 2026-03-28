@@ -37,9 +37,17 @@ const LONGSHOT_BIAS = {
   0.2: 0.14, // 20% → ~14%
 }
 
-// Efficient market threshold — if high volume + stable price, market is probably right
-const EFFICIENT_MARKET_VOLUME = 500000 // $500K+ daily = very efficient
-const EFFICIENT_MARKET_SPREAD = 0.02 // 2 cent spread = tight = efficient
+// Efficient market threshold — research: > $100K vol = 61% accuracy, > $500K = perfectly priced
+const EFFICIENT_MARKET_VOLUME = 500000
+// Sweet spot: $10K-$100K volume = inefficient enough to exploit
+const SWEET_SPOT_MIN = 10000
+const SWEET_SPOT_MAX = 100000
+// Catastrophe reserve — always keep 20% cash (Taleb/LTCM lesson)
+const CATASTROPHE_RESERVE = 0.20
+// Drawdown: -15% → liquidate (not -50% like before)
+const MAX_DRAWDOWN = 0.15
+// Livermore: need 2+ confirming signals
+const MIN_SIGNALS = 2
 
 /**
  * Correct for favorite-longshot bias
@@ -145,15 +153,21 @@ export async function evaluateMarket(market, bankroll = 1000) {
   const yesPrice = market.outcomes[0].price
   const noPrice = market.outcomes[1]?.price || 1 - yesPrice
 
-  // ── Check 1: Is the market efficiently priced? ────────────
+  // ── Check 1: Is the market in the sweet spot? ──────────────
+  // Research: $10K-$100K volume = inefficient (61% accuracy) = our edge
+  // $500K+ = efficiently priced = no edge = skip
   if (isEfficientlyPriced(market)) {
-    result.reasoning.push(
-      `Efficiently priced ($${(market.volume24hr / 1000).toFixed(0)}K vol) — smart money already got this right`,
-    )
+    result.reasoning.push(`Too efficient ($${(market.volume24hr / 1000).toFixed(0)}K vol) — skip`)
+    result.checks.efficiencyCheck = false
+  } else if (market.volume24hr >= SWEET_SPOT_MIN && market.volume24hr <= SWEET_SPOT_MAX) {
+    result.checks.efficiencyCheck = true
+    result.reasoning.push(`Sweet spot! $${(market.volume24hr / 1000).toFixed(0)}K vol — likely mispriced`)
+  } else if (market.volume24hr < SWEET_SPOT_MIN) {
+    result.reasoning.push(`Too illiquid ($${(market.volume24hr / 1000).toFixed(0)}K) — can't exit`)
     result.checks.efficiencyCheck = false
   } else {
     result.checks.efficiencyCheck = true
-    result.reasoning.push("Market may be inefficient — possible edge")
+    result.reasoning.push("Moderate volume — may have edge")
   }
 
   // ── Check 2: Am I falling for longshot bias? ──────────────
@@ -239,12 +253,19 @@ export async function evaluateMarket(market, bankroll = 1000) {
   // (Will be applied by caller based on which strategy this falls into)
   result.checks.historyCheck = true
 
+  // ── Count confirming signals (Livermore rule: need 2+) ────
+  let confirmingSignals = 0
+  if (result.checks.edgeCheck) confirmingSignals++
+  if (result.checks.newsCheck) confirmingSignals++
+  if (result.checks.whaleCheck) confirmingSignals++
+  if (result.checks.efficiencyCheck) confirmingSignals++ // sweet spot = signal itself
+
   // ── Final Decision ────────────────────────────────────────
   const checksPassesd = Object.values(result.checks).filter(Boolean).length
   const totalChecks = Object.keys(result.checks).length
 
-  // Must pass at least 5 of 7 checks AND have positive real edge
-  result.shouldTrade = checksPassesd >= 5 && realEdge > MIN_EDGE_PCT
+  // Must pass 5/7 checks AND have real edge AND 2+ confirming signals
+  result.shouldTrade = checksPassesd >= 5 && realEdge > MIN_EDGE_PCT && confirmingSignals >= MIN_SIGNALS
   result.confidence = checksPassesd / totalChecks
   result.score = realEdge * 100 * result.confidence
 
@@ -263,15 +284,18 @@ export async function evaluateMarket(market, bankroll = 1000) {
 
     // Kelly sizing with fractional Kelly (0.25) and strategy weight
     if (result.shouldTrade) {
+      // Catastrophe reserve: only deploy 80% of bankroll max
+      const deployable = bankroll * (1 - CATASTROPHE_RESERVE)
       const odds = result.direction === "BUY_YES" ? 1 / yesPrice - 1 : 1 / noPrice - 1
       const kelly = Math.max(0, (realEdge * odds - (1 - estimatedProb)) / odds)
       const stratWeight = adaptiveLearner.getStrategyWeight("Smart Brain")
       const timeMultiplier = timingWindow.sizeMultiplier
       result.betSize = Math.min(
-        bankroll * 0.05,
-        kelly * 0.25 * bankroll * stratWeight * timeMultiplier,
+        deployable * 0.05, // Max 5% of deployable (not total bankroll)
+        kelly * 0.25 * deployable * stratWeight * timeMultiplier,
       )
       result.betSize = Math.max(2, Math.round(result.betSize * 100) / 100)
+      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)} (Kelly ${(kelly * 100).toFixed(1)}% × 0.25 × ${(stratWeight * 100).toFixed(0)}% strat × ${(timeMultiplier * 100).toFixed(0)}% time)`)
     }
   }
 
