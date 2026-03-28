@@ -12,6 +12,7 @@ import scanner from "./market-scanner.mjs"
 import negRisk from "./negrisk-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import strategyEngine from "./strategy-engine.mjs"
+import selfImprover from "./self-improver.mjs"
 import db from "../database.mjs"
 
 // ── Safe Telegram sender (handles markdown errors) ──────────
@@ -497,21 +498,37 @@ const VIRTUAL_MAX_OPEN = 10 // Max 10 open positions
 async function autoVirtualTrade(scanResults) {
   const openPositions = virtualStmts.getOpenPositions.all()
   const openValue = virtualStmts.getOpenValue.get()?.total_invested || 0
-  const availableCapital = VIRTUAL_BANKROLL - openValue
+  const pnlData = virtualStmts.getVirtualPnL.get()
+  const currentBalance = VIRTUAL_BANKROLL + (pnlData?.total_pnl || 0)
+  const availableCapital = currentBalance - openValue
   let tradesPlaced = 0
 
-  console.log(`[VIRTUAL] Scan found ${scanResults.topPicks.length} picks. Open: ${openPositions.length}/${VIRTUAL_MAX_OPEN}. Capital: $${availableCapital.toFixed(2)}`)
+  // Drawdown check — reduce or stop trading if losing too much
+  const peakBalance = VIRTUAL_BANKROLL // Simple: use starting balance as peak
+  const drawdownKelly = selfImprover.getDrawdownAdjustedKelly(1.0, currentBalance, peakBalance)
+  if (drawdownKelly === 0) {
+    console.log(`[VIRTUAL] HALTED — drawdown too deep. Balance: $${currentBalance.toFixed(2)}`)
+    return 0
+  }
+
+  // Time-of-day check — trade smaller during low liquidity
+  const tradingWindow = selfImprover.getTradingWindow()
+  const timeMultiplier = tradingWindow.sizeMultiplier
+
+  console.log(`[VIRTUAL] Scan: ${scanResults.topPicks.length} picks | Open: ${openPositions.length}/${VIRTUAL_MAX_OPEN} | Balance: $${currentBalance.toFixed(2)} | Window: ${tradingWindow.window} (${tradingWindow.quality}) | Drawdown adj: ${(drawdownKelly * 100).toFixed(0)}%`)
 
   for (const pick of scanResults.topPicks) {
     if (openPositions.length + tradesPlaced >= VIRTUAL_MAX_OPEN) break
-    if (pick.score < 0.5) continue // Trade anything with positive score
+    if (pick.score < 0.5) continue
     if (!pick.market?.id) continue
 
     // Don't double up on same market
     if (openPositions.some((p) => p.market_id === pick.market.id)) continue
 
-    // Calculate bet size — use $5 minimum for virtual trades
-    let betSize = Math.max(5, Math.min(pick.betSize || 10, VIRTUAL_MAX_BET, availableCapital * 0.1))
+    // Calculate bet size with drawdown + time adjustments
+    let baseBet = Math.max(5, Math.min(pick.betSize || 10, VIRTUAL_MAX_BET, availableCapital * 0.1))
+    let betSize = baseBet * drawdownKelly * timeMultiplier
+    betSize = Math.max(2, Math.round(betSize * 100) / 100) // Min $2, round to cents
     if (availableCapital < betSize) continue
 
     // Get proper outcome and price based on strategy type

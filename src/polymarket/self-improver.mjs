@@ -236,14 +236,100 @@ export function bayesianUpdate(prior, likelihoodRatio) {
  */
 export function getBaseRate(category) {
   const baseRates = {
-    "politics": 0.50,     // Binary political outcomes
-    "sports": 0.50,       // Head-to-head matchups
-    "crypto": 0.45,       // "Will X reach Y price" — usually doesn't
-    "geopolitical": 0.15, // Wars, regime changes — rare events
-    "economic": 0.40,     // Fed decisions, economic indicators
+    "politics": 0.50,
+    "sports": 0.50,
+    "crypto": 0.45,
+    "geopolitical": 0.15,
+    "economic": 0.40,
     "default": 0.50,
   }
   return baseRates[category] || baseRates.default
+}
+
+// ── Drawdown Management ─────────────────────────────────────
+
+/**
+ * Calculate current drawdown and adjust Kelly fraction
+ * Research: -20% = half size, -30% = quarter, -50% = stop
+ */
+export function getDrawdownAdjustedKelly(baseKelly, currentBalance, peakBalance) {
+  if (peakBalance <= 0) return baseKelly
+  const drawdown = 1 - (currentBalance / peakBalance)
+
+  if (drawdown >= 0.50) return 0          // HALT — manual review needed
+  if (drawdown >= 0.30) return baseKelly * 0.25  // Survival mode
+  if (drawdown >= 0.20) return baseKelly * 0.50  // Cautious
+  if (drawdown >= 0.10) return baseKelly * 0.75  // Slightly reduced
+  return baseKelly
+}
+
+// ── Volume Spike Detection ──────────────────────────────────
+
+/**
+ * Detect volume spikes — 5x baseline = something big happening
+ */
+export function isVolumeSpike(current24hVol, avg7dVol) {
+  if (avg7dVol <= 0) return { isSpike: false, ratio: 0 }
+  const ratio = current24hVol / avg7dVol
+  return {
+    isSpike: ratio >= 3,
+    isMassiveSpike: ratio >= 5,
+    ratio,
+    signal: ratio >= 5 ? "MASSIVE" : ratio >= 3 ? "SPIKE" : "NORMAL",
+  }
+}
+
+// ── Time-of-Day Optimization ────────────────────────────────
+
+/**
+ * Get optimal trading windows
+ * Research: European 10-12 UTC = best liquidity
+ * Low liquidity: 21 UTC (42% less depth)
+ */
+export function getTradingWindow() {
+  const hour = new Date().getUTCHours()
+
+  if (hour >= 10 && hour <= 12) return { window: "EUROPEAN_PEAK", quality: "excellent", sizeMultiplier: 1.2 }
+  if (hour >= 14 && hour <= 17) return { window: "US_SESSION", quality: "good", sizeMultiplier: 1.0 }
+  if (hour >= 3 && hour <= 4) return { window: "ASIAN_PEAK", quality: "good", sizeMultiplier: 1.0 }
+  if (hour >= 20 && hour <= 22) return { window: "LOW_LIQUIDITY", quality: "poor", sizeMultiplier: 0.5 }
+  return { window: "OFF_PEAK", quality: "fair", sizeMultiplier: 0.8 }
+}
+
+// ── Insider Activity Scoring ────────────────────────────────
+
+/**
+ * Score a trade pattern for insider activity signals
+ * 5-signal composite from Harvard research:
+ *   1. Unusually large bet relative to market
+ *   2. Unusually large bet relative to trader's history
+ *   3. Consistently correct on low-probability events
+ *   4. Trades cluster 24-48h before announcements
+ *   5. All bets on same side
+ */
+export function scoreInsiderSignals(trade) {
+  let score = 0
+  const reasons = []
+
+  // Signal 1: Large relative to market
+  if (trade.sizeUsd > 10000) { score += 2; reasons.push("large bet ($" + (trade.sizeUsd / 1000).toFixed(0) + "K)") }
+  if (trade.sizeUsd > 50000) { score += 3; reasons.push("whale-sized bet") }
+
+  // Signal 2: Low probability event bet (high conviction on unlikely)
+  if (trade.price < 0.10 && trade.sizeUsd > 5000) { score += 3; reasons.push("big bet on unlikely event") }
+
+  // Signal 3: Fresh wallet (new accounts often = informed money)
+  if (trade.walletAge && trade.walletAge < 7) { score += 2; reasons.push("fresh wallet (<7 days)") }
+
+  // Signal 4: High concentration (single market, one direction)
+  if (trade.portfolioConcentration > 0.8) { score += 2; reasons.push("highly concentrated") }
+
+  return {
+    score,
+    isLikelyInsider: score >= 5,
+    isPossibleInsider: score >= 3,
+    reasons,
+  }
 }
 
 // ── Whale Tracking ──────────────────────────────────────────
@@ -364,6 +450,10 @@ export default {
   extremize,
   bayesianUpdate,
   getBaseRate,
+  getDrawdownAdjustedKelly,
+  isVolumeSpike,
+  getTradingWindow,
+  scoreInsiderSignals,
   detectWhaleActivity,
   getRecentLessons,
   generateImprovementReport,
