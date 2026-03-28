@@ -67,6 +67,7 @@ import {
 import { runSystemCommand } from "./src/system-commands.mjs"
 import { registerPolymarketCommands } from "./src/polymarket/telegram-commands.mjs"
 import liveMonitor from "./src/polymarket/live-monitor.mjs"
+import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
@@ -195,9 +196,10 @@ function isAdmin(userId) {
 // Register Polymarket trading commands
 registerPolymarketCommands(bot, isAdmin)
 
-// Initialize live monitor with bot instance
+// Initialize live monitor + auto-analyst with bot instance
 if (ownerChatId) {
   liveMonitor.init(bot, ownerChatId)
+  autoAnalyst.init(bot, ownerChatId)
 }
 
 // ── /pmstart — Start live monitoring ────────────────────────
@@ -207,6 +209,7 @@ bot.onText(/\/pmstart\s*(\d*)/, (msg, match) => {
 
   const bankroll = parseInt(match[1]) || 100
   liveMonitor.init(bot, chatId)
+  autoAnalyst.init(bot, chatId)
 
   if (liveMonitor.isRunning()) {
     bot.sendMessage(chatId, "Already monitoring! Use /pmstop to restart.")
@@ -214,16 +217,22 @@ bot.onText(/\/pmstart\s*(\d*)/, (msg, match) => {
   }
 
   liveMonitor.start(bankroll)
+  autoAnalyst.startAutonomous()
+
   bot.sendMessage(
     chatId,
-    `🟢 *Market Monitor Started*\n\n` +
-      `💰 Bankroll: $${bankroll}\n` +
-      `📡 Scanning every 5 minutes\n` +
-      `🔔 Alerts for score ≥ 3 opportunities\n` +
+    `🟢 *I'm now watching the markets 24/7*\n\n` +
+      `💰 Bankroll: $${bankroll}\n\n` +
+      `*What I'll do automatically:*\n` +
+      `📊 Market briefing every 2 hours\n` +
+      `🔍 Strategy scan every 5 minutes\n` +
+      `👀 Auto-manage watchlist every 15 min\n` +
+      `🧠 Self-evaluate predictions every 30 min\n` +
       `🛡️ Auto-snipe on 96%+ outcomes\n` +
-      `📊 Max ${20} trades/day\n\n` +
-      `I'll message you when I find something good!\n` +
-      `Use /pmstop to pause.`,
+      `⚖️ Alert on NegRisk arbitrage (risk-free)\n` +
+      `🐋 Whale trade alerts (>$10K)\n\n` +
+      `_I'll keep you posted — no need to ask!_\n` +
+      `Use /pmstop to pause everything.`,
     { parse_mode: "Markdown" },
   )
 })
@@ -233,8 +242,9 @@ bot.onText(/\/pmstop/, (msg) => {
   const chatId = msg.chat.id
   if (!isAdmin(msg.from.id)) return
 
+  autoAnalyst.stopAutonomous()
   if (liveMonitor.stop()) {
-    bot.sendMessage(chatId, "🔴 Market monitor stopped. Use /pmstart to resume.")
+    bot.sendMessage(chatId, "🔴 Everything paused. Use /pmstart to resume.")
   } else {
     bot.sendMessage(chatId, "Monitor isn't running.")
   }
@@ -306,6 +316,52 @@ bot.onText(/\/pmrules/, (msg) => {
       `_"The goal is not to make the most money. It's to never go broke."_`,
     { parse_mode: "Markdown" },
   )
+})
+
+// ── /pmeval — See how well I'm predicting ───────────────────
+bot.onText(/\/pmeval/, (msg) => {
+  const chatId = msg.chat.id
+  const report = autoAnalyst.getEvalReport()
+  bot.sendMessage(chatId, report.text, { parse_mode: "Markdown" })
+})
+
+// ── /pmauto — See auto-managed watchlist ────────────────────
+bot.onText(/\/pmauto/, (msg) => {
+  const chatId = msg.chat.id
+  const watchlist = autoAnalyst.getAutoWatchlist()
+
+  if (watchlist.length === 0) {
+    bot.sendMessage(chatId, "Watchlist is empty. Start monitoring with /pmstart and I'll auto-add interesting markets!")
+    return
+  }
+
+  const lines = watchlist.slice(0, 10).map((w, i) => {
+    const change = w.current_price - w.entry_price
+    const changeIcon = change > 0 ? "📈" : change < 0 ? "📉" : "➡️"
+    return `${i + 1}. ${changeIcon} *${w.market_question.slice(0, 50)}*\n` +
+      `   Entry: ${(w.entry_price * 100).toFixed(1)}% → Now: ${(w.current_price * 100).toFixed(1)}%\n` +
+      `   _${w.added_reason}_`
+  })
+
+  bot.sendMessage(
+    chatId,
+    `👀 *Auto-Watchlist (${watchlist.length} markets)*\n\n${lines.join("\n\n")}\n\n_I add/remove markets automatically based on opportunity score._`,
+    { parse_mode: "Markdown" },
+  )
+})
+
+// ── /pmbriefing — Force a market briefing now ───────────────
+bot.onText(/\/pmbriefing/, async (msg) => {
+  const chatId = msg.chat.id
+  const loading = await bot.sendMessage(chatId, "📊 _Preparing your briefing..._", { parse_mode: "Markdown" })
+
+  try {
+    const briefing = await autoAnalyst.generateBriefing()
+    bot.deleteMessage(chatId, loading.message_id).catch(() => {})
+    bot.sendMessage(chatId, briefing, { parse_mode: "Markdown" })
+  } catch (err) {
+    bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+  }
 })
 
 function splitMessage(text) {
