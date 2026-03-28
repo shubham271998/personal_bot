@@ -8,6 +8,8 @@ import scanner from "./market-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import trader from "./trader.mjs"
 import strategyEngine from "./strategy-engine.mjs"
+import marketMaker from "./market-maker.mjs"
+import executor from "./executor-bridge.mjs"
 
 export function registerPolymarketCommands(bot, isAdminFn) {
   // ── /pm — Overview ────────────────────────────────────────
@@ -32,6 +34,11 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         `/pmportfolio — Your positions\n` +
         `/pmpnl — Profit & loss\n` +
         `/pmhistory — Trade log\n\n` +
+        `*📊 Market Making:*\n` +
+        `/pmmaker — Find spread-capture opportunities (0% fees!)\n\n` +
+        `*💳 Wallet:*\n` +
+        `/pmwallet — Check balance\n` +
+        `/pmconnect <key> — Connect Polygon wallet\n\n` +
         `*⚙️ Settings:*\n` +
         `/pmsettings — Trading config\n\n` +
         `_Paper trading mode — no real money at risk!_`,
@@ -353,6 +360,112 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     const maxBet = parseInt(match[1])
     trader.updateSettings(msg.from.id, { maxBet })
     bot.sendMessage(msg.chat.id, `Max bet set to $${maxBet}`)
+  })
+
+  // ── /pmwallet — Connect wallet & check balance ────────────
+  bot.onText(/\/pmwallet$/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) {
+      bot.sendMessage(chatId, "Only admin can manage wallets.")
+      return
+    }
+
+    const settings = trader.getSettings(msg.from.id)
+    if (!settings.private_key) {
+      bot.sendMessage(
+        chatId,
+        `💳 *Connect Your Polygon Wallet*\n\n` +
+          `To trade with real money, I need your Polygon wallet private key.\n\n` +
+          `Use: /pmconnect <private_key>\n\n` +
+          `⚠️ _Make sure this wallet has USDC on Polygon network._\n` +
+          `_Your key is encrypted and stored securely._`,
+        { parse_mode: "Markdown" },
+      )
+      return
+    }
+
+    try {
+      const balance = await executor.getBalance(settings.private_key)
+      bot.sendMessage(
+        chatId,
+        `💳 *Your Wallet*\n\n` +
+          `Address: \`${balance.address}\`\n` +
+          `USDC: *$${balance.usdc.toFixed(2)}*\n` +
+          `MATIC: ${balance.matic.toFixed(4)}\n\n` +
+          `Mode: ${settings.paper_mode ? "📝 Paper" : "💰 Live"}`,
+        { parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.sendMessage(chatId, `Wallet check failed: ${err.message}`)
+    }
+  })
+
+  // ── /pmconnect — Set private key ──────────────────────────
+  bot.onText(/\/pmconnect\s+(.+)/, async (msg, match) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    // Delete the message with the key immediately
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {})
+
+    const key = match[1].trim()
+    if (!key.startsWith("0x") || key.length !== 66) {
+      bot.sendMessage(chatId, "Invalid private key format. Should be 0x + 64 hex characters.")
+      return
+    }
+
+    try {
+      const balance = await executor.getBalance(key)
+      trader.updateSettings(msg.from.id, { privateKey: key })
+
+      bot.sendMessage(
+        chatId,
+        `✅ *Wallet Connected!*\n\n` +
+          `Address: \`${balance.address}\`\n` +
+          `USDC: $${balance.usdc.toFixed(2)}\n` +
+          `MATIC: ${balance.matic.toFixed(4)}\n\n` +
+          `_Key deleted from chat & encrypted._\n` +
+          `Use /pmset paper off to enable live trading.`,
+        { parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.sendMessage(chatId, `Couldn't connect wallet: ${err.message}`)
+    }
+  })
+
+  // ── /pmmaker — Market making opportunities ────────────────
+  bot.onText(/\/pmmaker/, async (msg) => {
+    const chatId = msg.chat.id
+    const loading = await bot.sendMessage(chatId, "📊 _Finding market making opportunities..._", { parse_mode: "Markdown" })
+
+    try {
+      const markets = await scanner.getTopMarkets(30)
+      const opps = await marketMaker.findMMOpportunities(markets)
+
+      if (opps.length === 0) {
+        bot.editMessageText("No good market making opportunities right now.", {
+          chat_id: chatId, message_id: loading.message_id,
+        })
+        return
+      }
+
+      const lines = opps.slice(0, 5).map((o, i) => {
+        const sim = marketMaker.simulateMMSession(o.mid, parseFloat(o.optimalSpread) / 100, 100)
+        return `${i + 1}. *${o.market.question.slice(0, 55)}*\n` +
+          `   Spread: ${o.currentSpread}% → optimal ${o.optimalSpread}%\n` +
+          `   Mid: ${(o.mid * 100).toFixed(1)}% | Depth: $${(o.bidDepth / 1000).toFixed(0)}K/$${(o.askDepth / 1000).toFixed(0)}K\n` +
+          `   Est. daily: *~$${o.estDailyRevenue}* (0 fees + rebates)\n` +
+          `   Sim: Buy@${sim.buyPrice} Sell@${sim.sellPrice} → $${sim.totalProfit}/round`
+      })
+
+      bot.editMessageText(
+        `📊 *Market Making Opportunities*\n` +
+          `_Makers pay 0% fees + earn rebates!_\n\n${lines.join("\n\n")}`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+    }
   })
 
   // ── /pmscan — Full strategy scan (the big one) ────────────
