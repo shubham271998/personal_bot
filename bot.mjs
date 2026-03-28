@@ -70,6 +70,7 @@ import liveMonitor from "./src/polymarket/live-monitor.mjs"
 import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 import selfImprover from "./src/polymarket/self-improver.mjs"
 import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
+import smartBrain from "./src/polymarket/smart-brain.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_MODE = process.env.BOT_MODE || (process.platform === "darwin" ? "🏠 Local" : "☁️ Cloud")
@@ -156,6 +157,7 @@ bot.setMyCommands([
   { command: "pmhistory", description: "Trade log" },
   { command: "pmscorecard", description: "Virtual trading P&L scorecard" },
   { command: "pmeval", description: "My prediction accuracy" },
+  { command: "pmbrain", description: "Smart brain scan with reasoning" },
   { command: "pmlearn", description: "What I've learned from mistakes" },
   { command: "pmreport", description: "Full self-improvement report" },
   { command: "pmwhale", description: "Whale activity on a market" },
@@ -372,6 +374,44 @@ bot.onText(/\/pmscorecard/, (msg) => {
   const chatId = msg.chat.id
   const scorecard = autoAnalyst.generateScorecard()
   bot.sendMessage(chatId, scorecard, { parse_mode: "Markdown" })
+})
+
+// ── /pmbrain — Smart brain scan with full reasoning ─────────
+bot.onText(/\/pmbrain/, async (msg) => {
+  const chatId = msg.chat.id
+  const loading = await bot.sendMessage(chatId, "🧠 _Running smart brain scan... checking 30 markets through 7 filters..._", { parse_mode: "Markdown" })
+
+  try {
+    const scan = await smartBrain.smartScan(1000)
+
+    let text = `🧠 *Smart Brain Report*\n\n`
+    text += `Scanned: ${scan.total} markets\n`
+    text += `Approved: ${scan.approved.length} | Skipped: ${scan.skipped}\n\n`
+
+    if (scan.approved.length === 0) {
+      text += `_No trades pass all 7 checks right now._\n`
+      text += `_This is GOOD — means I'm being selective, not throwing money at everything._\n\n`
+      text += `The 7 checks:\n`
+      text += `1. Edge > 7% after costs\n`
+      text += `2. Market not efficiently priced\n`
+      text += `3. No longshot bias trap\n`
+      text += `4. News confirms direction\n`
+      text += `5. Whale activity supports\n`
+      text += `6. Good trading window\n`
+      text += `7. Strategy historically profitable`
+    } else {
+      for (const pick of scan.approved.slice(0, 5)) {
+        text += `*${(pick.market?.question || "").slice(0, 50)}*\n`
+        text += smartBrain.explainDecision(pick) + `\n\n`
+      }
+    }
+
+    bot.editMessageText(text, { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" }).catch(() =>
+      bot.editMessageText(text.replace(/[*_`\[\]\\]/g, ""), { chat_id: chatId, message_id: loading.message_id }),
+    )
+  } catch (err) {
+    bot.editMessageText(`Brain scan failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+  }
 })
 
 // ── /pmlearn — What has the bot learned from its mistakes ───

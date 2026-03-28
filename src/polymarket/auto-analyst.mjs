@@ -14,6 +14,7 @@ import newsAnalyzer from "./news-analyzer.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import selfImprover from "./self-improver.mjs"
 import adaptiveLearner from "./adaptive-learner.mjs"
+import smartBrain from "./smart-brain.mjs"
 import db from "../database.mjs"
 
 // ── Deduplication — track what we've already notified/traded ─
@@ -952,35 +953,71 @@ async function runVirtualTradingCycle() {
       )
     }
 
-    // 2. Run strategy scan and auto-trade new picks
-    const scan = await strategyEngine.runFullScan(VIRTUAL_BANKROLL)
-    const tradesPlaced = await autoVirtualTrade(scan)
+    // 2. Run SMART BRAIN scan (replaces dumb strategy scan)
+    const pnlData = virtualStmts.getVirtualPnL.get()
+    const currentBalance = VIRTUAL_BANKROLL + (pnlData?.total_pnl || 0)
+    const openPositions = virtualStmts.getOpenPositions.all()
 
-    if (tradesPlaced > 0) {
-      const openPositions = virtualStmts.getOpenPositions.all()
-      const recent = openPositions.slice(-tradesPlaced)
-      const lines = recent.map((p) =>
-        `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
-      )
-      await safeSend(_bot, _chatId,
-        `📝 *Auto-Traded ${tradesPlaced} positions*\n\n${lines.join("\n")}\n\n_Virtual $${VIRTUAL_BANKROLL} bankroll_`,
-      )
+    const brainScan = await smartBrain.smartScan(currentBalance)
+    let tradesPlaced = 0
+
+    for (const pick of brainScan.approved.slice(0, 3)) {
+      if (openPositions.length + tradesPlaced >= VIRTUAL_MAX_OPEN) break
+      if (!pick.market?.id) continue
+      if (_tradedMarkets.has(pick.market.id)) continue
+
+      const price = pick.market.outcomes?.find(o => o.name === pick.outcome)?.price || 0.5
+      if (price <= 0.01 || price >= 0.99) continue
+
+      const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
+      if (betSize < 2 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
+
+      const shares = betSize / price
+
+      try {
+        virtualStmts.openPosition.run(
+          pick.market.id, (pick.market.question || "").slice(0, 200),
+          pick.outcome || "YES", pick.direction || "BUY",
+          price, shares, betSize, "Smart Brain",
+        )
+        _tradedMarkets.add(pick.market.id)
+        tradesPlaced++
+        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${(pick.confidence * 100).toFixed(0)}% conf)`)
+      } catch (err) {
+        console.error(`[BRAIN] Trade failed:`, err.message)
+      }
     }
 
-    // 3. Record predictions (deduplicated — max 1 per market per 2 hours)
-    for (const pick of scan.topPicks.slice(0, 3)) {
-      const mId = pick.market?.id || pick.event?.eventId
+    const tag = process.platform === "darwin" ? "🏠" : "☁️"
+    if (tradesPlaced > 0) {
+      const allOpen = virtualStmts.getOpenPositions.all()
+      const recent = allOpen.slice(-tradesPlaced)
+      const lines = recent.map((p) =>
+        `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)}`,
+      )
+      await safeSend(_bot, _chatId,
+        `${tag} *Smart Trade* (${brainScan.approved.length} approved / ${brainScan.skipped} skipped)\n\n${lines.join("\n")}\n\n` +
+          `_Checks: edge>7%, no longshot bias, whale + news confirmed_`,
+      )
+    } else if (brainScan.approved.length === 0) {
+      // Every few cycles, report that we're watching but not trading
+      console.log(`[BRAIN] No trades — all ${brainScan.total} markets failed quality checks`)
+    }
+
+    // 3. Record predictions from brain-approved picks (deduplicated)
+    for (const pick of brainScan.approved.slice(0, 3)) {
+      const mId = pick.market?.id
       if (!mId || !shouldPredict(mId)) continue
 
-      const outcome = pick.outcome || pick.market?.outcomes?.[0]?.name || "YES"
-      const marketPrice = pick.currentPrice || pick.price || pick.market?.outcomes?.[0]?.price || 0.5
-      const estimatedProb = pick.estimatedProb || (pick.direction === "BUY_YES" ? Math.min(0.95, marketPrice + 0.15) : marketPrice)
-      const question = pick.market?.question || pick.event?.title || ""
+      const outcome = pick.outcome || "YES"
+      const marketPrice = pick.market?.outcomes?.[0]?.price || 0.5
+      const question = pick.market?.question || ""
+      const reasoning = (pick.reasoning || []).join("; ")
 
       recordPrediction(
         mId, question.slice(0, 200),
-        outcome, estimatedProb, marketPrice,
-        Math.min(1, pick.score / 10), pick.reasoning?.slice(0, 300) || "",
+        outcome, pick.confidence || 0.5, marketPrice,
+        pick.confidence || 0.5, reasoning.slice(0, 300),
       )
     }
   } catch (err) {
