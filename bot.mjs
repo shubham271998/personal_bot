@@ -69,6 +69,7 @@ import { registerPolymarketCommands } from "./src/polymarket/telegram-commands.m
 import liveMonitor from "./src/polymarket/live-monitor.mjs"
 import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 import selfImprover from "./src/polymarket/self-improver.mjs"
+import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const BOT_MODE = process.env.BOT_MODE || (process.platform === "darwin" ? "🏠 Local" : "☁️ Cloud")
@@ -155,6 +156,7 @@ bot.setMyCommands([
   { command: "pmhistory", description: "Trade log" },
   { command: "pmscorecard", description: "Virtual trading P&L scorecard" },
   { command: "pmeval", description: "My prediction accuracy" },
+  { command: "pmlearn", description: "What I've learned from mistakes" },
   { command: "pmreport", description: "Full self-improvement report" },
   { command: "pmwhale", description: "Whale activity on a market" },
   { command: "pmauto", description: "Auto-watchlist" },
@@ -370,6 +372,19 @@ bot.onText(/\/pmscorecard/, (msg) => {
   const chatId = msg.chat.id
   const scorecard = autoAnalyst.generateScorecard()
   bot.sendMessage(chatId, scorecard, { parse_mode: "Markdown" })
+})
+
+// ── /pmlearn — What has the bot learned from its mistakes ───
+bot.onText(/\/pmlearn/, (msg) => {
+  const chatId = msg.chat.id
+  try {
+    const report = adaptiveLearner.generateLearningReport()
+    bot.sendMessage(chatId, report, { parse_mode: "Markdown" }).catch(() =>
+      bot.sendMessage(chatId, report.replace(/[*_`\[\]\\]/g, "")),
+    )
+  } catch (err) {
+    bot.sendMessage(chatId, `Report failed: ${err.message}`)
+  }
 })
 
 // ── /pmeval — See how well I'm predicting ───────────────────

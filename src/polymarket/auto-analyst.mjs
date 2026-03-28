@@ -13,6 +13,7 @@ import negRisk from "./negrisk-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import selfImprover from "./self-improver.mjs"
+import adaptiveLearner from "./adaptive-learner.mjs"
 import db from "../database.mjs"
 
 // ── Deduplication — track what we've already notified/traded ─
@@ -556,9 +557,18 @@ async function autoVirtualTrade(scanResults) {
     if (openPositions.some((p) => p.market_id === mId)) continue
     if (_tradedMarkets.has(mId)) continue
 
-    // Calculate bet size with drawdown + time adjustments
+    // Get adaptive strategy weight (learned from past performance)
+    const strategyWeight = adaptiveLearner.getStrategyWeight(pick.strategy || "Unknown")
+
+    // Check if this price range is safe (learned from past losses)
+    if (!adaptiveLearner.isPriceRangeSafe(price)) {
+      console.log(`[VIRTUAL] Skipped: ${outcome.slice(0, 25)} — price range ${(price * 100).toFixed(0)}% disabled by learner`)
+      continue
+    }
+
+    // Calculate bet size: base × drawdown × time × strategy_weight
     let baseBet = Math.max(5, Math.min(pick.betSize || 10, VIRTUAL_MAX_BET, availableCapital * 0.1))
-    let betSize = baseBet * drawdownKelly * timeMultiplier
+    let betSize = baseBet * drawdownKelly * timeMultiplier * strategyWeight
     betSize = Math.max(2, Math.round(betSize * 100) / 100) // Min $2, round to cents
     if (availableCapital < betSize) continue
 
@@ -694,6 +704,16 @@ async function checkVirtualPositions() {
         const pnl = (currentPrice - pos.entry_price) * pos.shares
         virtualStmts.closePosition.run(currentPrice, pnl, pos.id)
         closed.push({ ...pos, exit_price: currentPrice, pnl, close_reason: closeReason })
+
+        // LEARN from this trade — adjust weights for future
+        adaptiveLearner.learnFromTrade({
+          strategy: pos.strategy,
+          entry_price: pos.entry_price,
+          pnl,
+          close_reason: closeReason,
+        })
+        _tradedMarkets.delete(pos.market_id) // Allow re-trading this market
+
         console.log(`[VIRTUAL] Closed: ${pos.outcome.slice(0, 25)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} (${closeReason})`)
       }
     } catch (err) {
