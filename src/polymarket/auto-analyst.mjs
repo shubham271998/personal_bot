@@ -562,36 +562,77 @@ async function checkVirtualPositions() {
   for (const pos of openPositions) {
     try {
       const market = await scanner.getMarket(pos.market_id)
+
+      // If market not found or errored, skip (don't close)
       if (!market) continue
 
-      // Market resolved
-      if (!market.active) {
-        const resolvedPrice = market.outcomes.find((o) =>
+      // Find current price for our outcome
+      let currentPrice = pos.entry_price
+      if (market.outcomes) {
+        const match = market.outcomes.find((o) =>
           o.name.toLowerCase().includes(pos.outcome.toLowerCase()),
-        )?.price || 0
-
-        const exitPrice = resolvedPrice >= 0.99 ? 1.0 : resolvedPrice <= 0.01 ? 0.0 : resolvedPrice
-        const pnl = (exitPrice - pos.entry_price) * pos.shares
-
-        virtualStmts.closePosition.run(exitPrice, pnl, pos.id)
-        closed.push({ ...pos, exit_price: exitPrice, pnl })
-        continue
+        )
+        if (match) currentPrice = match.price
       }
 
-      // Stop loss check for medium/high risk
-      const currentPrice = market.outcomes.find((o) =>
-        o.name.toLowerCase().includes(pos.outcome.toLowerCase()),
-      )?.price || pos.entry_price
+      let shouldClose = false
+      let closeReason = ""
 
-      if (pos.strategy !== "Resolution Snipe" && pos.strategy !== "Arbitrage") {
-        const lossThreshold = pos.entry_price * 0.70 // -30% stop
-        if (currentPrice < lossThreshold) {
-          const pnl = (currentPrice - pos.entry_price) * pos.shares
-          virtualStmts.closePosition.run(currentPrice, pnl, pos.id)
-          closed.push({ ...pos, exit_price: currentPrice, pnl })
+      // 1. Market resolved → close with final price
+      if (!market.active) {
+        currentPrice = currentPrice >= 0.99 ? 1.0 : currentPrice <= 0.01 ? 0.0 : currentPrice
+        shouldClose = true
+        closeReason = "resolved"
+      }
+
+      // 2. Take profit: price moved +20% from entry → lock in gains
+      if (!shouldClose && currentPrice >= pos.entry_price * 1.20 && pos.strategy !== "Resolution Snipe") {
+        shouldClose = true
+        closeReason = "take-profit (+20%)"
+      }
+
+      // 3. Resolution snipe: price hit 99%+ → take the guaranteed money
+      if (!shouldClose && pos.strategy === "Resolution Snipe" && currentPrice >= 0.99) {
+        currentPrice = 1.0
+        shouldClose = true
+        closeReason = "snipe-resolved"
+      }
+
+      // 4. Stop loss: -30% for risky, -15% for medium
+      if (!shouldClose && pos.strategy !== "Resolution Snipe" && pos.strategy !== "Arbitrage") {
+        const stopPct = pos.strategy === "Long Shot" ? 0.50 : 0.70
+        if (currentPrice < pos.entry_price * stopPct) {
+          shouldClose = true
+          closeReason = `stop-loss (${((1 - stopPct) * 100).toFixed(0)}%)`
         }
       }
-    } catch { continue }
+
+      // 5. Long shots at 0 → write off
+      if (!shouldClose && pos.strategy === "Long Shot" && currentPrice <= 0.005) {
+        currentPrice = 0
+        shouldClose = true
+        closeReason = "expired-worthless"
+      }
+
+      // 6. Stale positions: open for >7 days with no movement → close
+      if (!shouldClose) {
+        const ageHours = (Date.now() - new Date(pos.created_at).getTime()) / 3600000
+        if (ageHours > 168) { // 7 days
+          shouldClose = true
+          closeReason = "stale (7+ days)"
+        }
+      }
+
+      if (shouldClose) {
+        const pnl = (currentPrice - pos.entry_price) * pos.shares
+        virtualStmts.closePosition.run(currentPrice, pnl, pos.id)
+        closed.push({ ...pos, exit_price: currentPrice, pnl, close_reason: closeReason })
+        console.log(`[VIRTUAL] Closed: ${pos.outcome.slice(0, 25)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} (${closeReason})`)
+      }
+    } catch (err) {
+      console.error(`[VIRTUAL] Position check error: ${err.message}`)
+      continue
+    }
   }
 
   return closed
@@ -632,6 +673,23 @@ function generateScorecard() {
   ).join("\n")
 
   const tag = process.platform === "darwin" ? "🏠" : "☁️"
+
+  // Learning insights
+  const recentClosed = db.raw.prepare(
+    `SELECT strategy, COUNT(*) as cnt, SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins, SUM(pnl) as total_pnl
+     FROM pm_virtual_portfolio WHERE status='closed' GROUP BY strategy`
+  ).all()
+
+  let learningText = ""
+  if (recentClosed.length > 0) {
+    learningText = `\n*What I'm learning:*\n`
+    for (const s of recentClosed) {
+      const wr = s.cnt > 0 ? (s.wins / s.cnt * 100).toFixed(0) : 0
+      const emoji = s.total_pnl >= 0 ? "✅" : "❌"
+      learningText += `${emoji} ${s.strategy}: ${wr}% win rate, ${s.total_pnl >= 0 ? "+" : ""}$${s.total_pnl.toFixed(2)}\n`
+    }
+  }
+
   return `${tag} *Virtual Trading Scorecard*\n\n` +
     `*Balance:* $${currentBalance.toFixed(2)} (started $${VIRTUAL_BANKROLL})\n` +
     `*Total P&L:* ${totalPnL >= 0 ? "+" : ""}$${totalPnL.toFixed(2)} (${roi >= 0 ? "+" : ""}${roi.toFixed(1)}%)\n` +
@@ -645,6 +703,7 @@ function generateScorecard() {
     `*Rating:* ${rating}\n\n` +
     (openPositions.length > 0 ? `*Open Positions (${openPositions.length}):*\n${posLines}\n\n` : "") +
     `*Capital:* $${(currentBalance - openValue).toFixed(2)} free / $${openValue.toFixed(2)} invested\n` +
+    learningText + `\n` +
     `_Virtual money — tracking to prove the system works before going live_`
 }
 
@@ -790,12 +849,22 @@ async function runVirtualTradingCycle() {
     // 1. Check and close resolved positions
     const closed = await checkVirtualPositions()
     if (closed.length > 0) {
+      const totalPnl = closed.reduce((s, c) => s + c.pnl, 0)
       const lines = closed.map((c) => {
         const icon = c.pnl >= 0 ? "✅" : "❌"
-        return `${icon} ${c.outcome.slice(0, 30)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}`
+        const reason = c.close_reason ? ` (${c.close_reason})` : ""
+        return `${icon} ${c.outcome.slice(0, 25)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}${reason}`
       })
+
+      const tag = process.platform === "darwin" ? "🏠" : "☁️"
+      const pnlStats = virtualStmts.getVirtualPnL.get()
+      const balance = VIRTUAL_BANKROLL + (pnlStats?.total_pnl || 0)
+
       await safeSend(_bot, _chatId,
-        `💰 *Positions Closed*\n\n${lines.join("\n")}\n\n_Virtual trading — tracking performance_`,
+        `${tag} *Positions Closed*\n\n${lines.join("\n")}\n\n` +
+          `Session P&L: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}\n` +
+          `Balance: $${balance.toFixed(2)} / $${VIRTUAL_BANKROLL}\n` +
+          `Win rate: ${pnlStats?.total_trades > 0 ? (pnlStats.wins / pnlStats.total_trades * 100).toFixed(0) : 0}%`,
       )
     }
 
