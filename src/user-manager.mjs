@@ -1,159 +1,81 @@
 /**
- * User Manager — Multi-tenant user management
+ * User Manager — Multi-tenant user management backed by SQLite
  *
- * Each user connects their own Claude (Anthropic API key).
- * Tracks per-user usage, sessions, and spending.
- * Persists to data/users.json
+ * Auth methods:
+ *   1. "api_key" — User provides their Anthropic API key
+ *   2. "claude_login" — User logs in via Anthropic email (validated via SDK)
+ *
+ * All API keys encrypted at rest. Admin is ONLY ALLOWED_TELEGRAM_IDS.
  */
-import fs from "fs"
-import path from "path"
-import { fileURLToPath } from "url"
 import crypto from "crypto"
-import { encryptSecure, decryptSecure } from "./security.mjs"
+import db from "./database.mjs"
+import { encryptSecure, decryptSecure, isValidApiKeyFormat } from "./security.mjs"
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const USERS_FILE = path.resolve(__dirname, "../data/users.json")
-
-// Encryption master key — MUST be set via env in production
 const MASTER_KEY = process.env.USER_ENCRYPT_KEY || crypto.randomBytes(32).toString("hex")
 if (!process.env.USER_ENCRYPT_KEY) {
   console.warn("[USER-MGR] ⚠️  USER_ENCRYPT_KEY not set — using random key (API keys won't persist across restarts!)")
 }
 
-function encrypt(text) {
-  return encryptSecure(text, MASTER_KEY)
-}
-
-function decrypt(text) {
-  return decryptSecure(text, MASTER_KEY)
-}
-
-/**
- * User record:
- * {
- *   telegramId: number,
- *   username: string,
- *   firstName: string,
- *   apiKey: string (encrypted),
- *   registeredAt: string (ISO),
- *   lastActiveAt: string (ISO),
- *   isApproved: boolean,
- *   isAdmin: boolean,
- *   usage: {
- *     totalSessions: number,
- *     totalCostUsd: number,
- *     totalInputTokens: number,
- *     totalOutputTokens: number,
- *     totalCacheTokens: number,
- *     dailyCostUsd: { [date]: number },
- *     lastSessionAt: string,
- *   }
- * }
- */
+const ADMIN_IDS = (process.env.ALLOWED_TELEGRAM_IDS || "")
+  .split(",").map(Number).filter(Boolean)
 
 class UserManager {
-  constructor() {
-    this.users = new Map()
-    this._load()
-  }
-
-  _load() {
-    try {
-      if (fs.existsSync(USERS_FILE)) {
-        const data = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"))
-        for (const user of data) {
-          this.users.set(user.telegramId, user)
-        }
-      }
-    } catch {
-      console.error("[USER-MGR] Failed to load users file")
-    }
-  }
-
-  _save() {
-    try {
-      const dir = path.dirname(USERS_FILE)
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(USERS_FILE, JSON.stringify([...this.users.values()], null, 2))
-    } catch (err) {
-      console.error("[USER-MGR] Failed to save:", err.message)
-    }
+  /**
+   * Register or update a user
+   */
+  register(telegramId, { username, firstName } = {}) {
+    db.upsertUser(telegramId, username, firstName)
+    return db.getUser(telegramId)
   }
 
   /**
-   * Check if a user exists
+   * Check if user exists
    */
   exists(telegramId) {
-    return this.users.has(telegramId)
+    return !!db.getUser(telegramId)
   }
 
   /**
    * Get user record
    */
   get(telegramId) {
-    return this.users.get(telegramId) || null
+    return db.getUser(telegramId)
   }
 
   /**
-   * Check if user has set up their API key
+   * Check if user has API key set
    */
   hasApiKey(telegramId) {
-    const user = this.users.get(telegramId)
-    return user?.apiKey ? true : false
+    return db.hasApiKey(telegramId)
   }
 
   /**
-   * Get decrypted API key for a user
+   * Get decrypted API key
    */
   getApiKey(telegramId) {
-    const user = this.users.get(telegramId)
-    if (!user?.apiKey) return null
-    return decrypt(user.apiKey)
+    const encrypted = db.getApiKey(telegramId)
+    if (!encrypted) return null
+    db.touchApiKey(telegramId)
+    return decryptSecure(encrypted, MASTER_KEY)
   }
 
   /**
-   * Register a new user (or update existing)
-   */
-  register(telegramId, { username, firstName }) {
-    let user = this.users.get(telegramId)
-    if (user) {
-      user.username = username || user.username
-      user.firstName = firstName || user.firstName
-      user.lastActiveAt = new Date().toISOString()
-    } else {
-      user = {
-        telegramId,
-        username: username || "",
-        firstName: firstName || "",
-        apiKey: null,
-        registeredAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-        isApproved: false,
-        isAdmin: false,
-        usage: {
-          totalSessions: 0,
-          totalCostUsd: 0,
-          totalInputTokens: 0,
-          totalOutputTokens: 0,
-          totalCacheTokens: 0,
-          dailyCostUsd: {},
-          lastSessionAt: null,
-        },
-      }
-      this.users.set(telegramId, user)
-    }
-    this._save()
-    return user
-  }
-
-  /**
-   * Set API key for a user
+   * Set API key (encrypts before storing)
    */
   setApiKey(telegramId, apiKey) {
-    const user = this.users.get(telegramId)
-    if (!user) return false
-    user.apiKey = encrypt(apiKey)
-    this._save()
+    const encrypted = encryptSecure(apiKey, MASTER_KEY)
+    db.setApiKey(telegramId, encrypted)
+    db.setAuthMethod(telegramId, "api_key")
+    return true
+  }
+
+  /**
+   * Set API key from Claude login flow (same storage, different auth_method)
+   */
+  setApiKeyFromLogin(telegramId, apiKey) {
+    const encrypted = encryptSecure(apiKey, MASTER_KEY)
+    db.setApiKey(telegramId, encrypted)
+    db.setAuthMethod(telegramId, "claude_login")
     return true
   }
 
@@ -161,125 +83,86 @@ class UserManager {
    * Remove API key
    */
   removeApiKey(telegramId) {
-    const user = this.users.get(telegramId)
-    if (!user) return false
-    user.apiKey = null
-    this._save()
+    db.deleteApiKey(telegramId)
+    db.setAuthMethod(telegramId, "none")
     return true
   }
 
   /**
-   * Approve a user (admin action)
+   * Approve a user
    */
   approve(telegramId) {
-    const user = this.users.get(telegramId)
-    if (!user) return false
-    user.isApproved = true
-    this._save()
-    return true
+    return db.approveUser(telegramId)
   }
 
   /**
-   * Block a user (admin action)
+   * Block a user
    */
   block(telegramId) {
-    const user = this.users.get(telegramId)
-    if (!user) return false
-    user.isApproved = false
-    this._save()
-    return true
+    return db.blockUser(telegramId)
   }
 
   /**
-   * Set admin flag — ONLY callable internally, never from user commands.
-   * Admin is locked to ALLOWED_TELEGRAM_IDS in .env
-   */
-  setAdmin(telegramId, isAdmin = true) {
-    const user = this.users.get(telegramId)
-    if (!user) return false
-    user.isAdmin = isAdmin
-    this._save()
-    return true
-  }
-
-  /**
-   * Check if user is admin (admins are ONLY from ALLOWED_TELEGRAM_IDS)
+   * Check if user is admin (ONLY from ALLOWED_TELEGRAM_IDS — nobody else, ever)
    */
   isAdmin(telegramId) {
-    const allowedIds = (process.env.ALLOWED_TELEGRAM_IDS || "")
-      .split(",").map(Number).filter(Boolean)
-    return allowedIds.includes(telegramId)
+    return ADMIN_IDS.includes(telegramId)
   }
 
   /**
-   * Record usage from a Claude session
+   * Record session usage
    */
   recordUsage(telegramId, meta) {
-    const user = this.users.get(telegramId)
-    if (!user || !meta) return
-
-    const today = new Date().toISOString().split("T")[0]
-
-    user.usage.totalSessions++
-    user.usage.totalCostUsd += meta.costUsd || 0
-    user.usage.totalInputTokens += meta.usage?.inputTokens || 0
-    user.usage.totalOutputTokens += meta.usage?.outputTokens || 0
-    user.usage.totalCacheTokens += (meta.usage?.cacheReadTokens || 0) + (meta.usage?.cacheCreationTokens || 0)
-    user.usage.lastSessionAt = new Date().toISOString()
-
-    if (!user.usage.dailyCostUsd[today]) user.usage.dailyCostUsd[today] = 0
-    user.usage.dailyCostUsd[today] += meta.costUsd || 0
-
-    user.lastActiveAt = new Date().toISOString()
-
-    // Keep only last 30 days of daily cost
-    const keys = Object.keys(user.usage.dailyCostUsd).sort()
-    if (keys.length > 30) {
-      for (const key of keys.slice(0, keys.length - 30)) {
-        delete user.usage.dailyCostUsd[key]
-      }
-    }
-
-    this._save()
+    if (!meta) return
+    db.recordSession(telegramId, {
+      project: meta.projectName || "default",
+      prompt: meta.prompt || "",
+      responseLen: meta.responseLen || 0,
+      durationMs: meta.durationMs || 0,
+      costUsd: meta.costUsd || 0,
+      inputTokens: meta.usage?.inputTokens || 0,
+      outputTokens: meta.usage?.outputTokens || 0,
+      cacheTokens: (meta.usage?.cacheReadTokens || 0) + (meta.usage?.cacheCreationTokens || 0),
+      model: meta.model || "unknown",
+      status: meta.status || "success",
+      error: meta.error || null,
+    })
+    db.touchUser(telegramId)
   }
 
   /**
    * Get usage summary for a user
    */
   getUsageSummary(telegramId) {
-    const user = this.users.get(telegramId)
-    if (!user) return null
-
-    const today = new Date().toISOString().split("T")[0]
-    const u = user.usage
-
-    return {
-      totalSessions: u.totalSessions,
-      totalCostUsd: u.totalCostUsd,
-      todayCostUsd: u.dailyCostUsd[today] || 0,
-      totalInputTokens: u.totalInputTokens,
-      totalOutputTokens: u.totalOutputTokens,
-      totalCacheTokens: u.totalCacheTokens,
-      lastSessionAt: u.lastSessionAt,
-      avgCostPerSession: u.totalSessions > 0 ? u.totalCostUsd / u.totalSessions : 0,
-    }
+    return db.getUserUsageSummary(telegramId)
   }
 
   /**
-   * List all users (admin)
+   * Get daily breakdown
+   */
+  getDailyBreakdown(telegramId, days = 7) {
+    return db.getUserDailyBreakdown(telegramId, days)
+  }
+
+  /**
+   * Get recent sessions
+   */
+  getRecentSessions(telegramId, limit = 10) {
+    return db.getUserSessions(telegramId, limit)
+  }
+
+  /**
+   * List all users (admin view)
    */
   listAll() {
-    return [...this.users.values()].map((u) => ({
-      telegramId: u.telegramId,
-      username: u.username,
-      firstName: u.firstName,
-      isApproved: u.isApproved,
-      isAdmin: u.isAdmin,
-      hasKey: !!u.apiKey,
-      totalSessions: u.usage.totalSessions,
-      totalCostUsd: u.usage.totalCostUsd,
-      lastActiveAt: u.lastActiveAt,
-    }))
+    return db.listUsers()
+  }
+
+  /**
+   * Global stats (admin)
+   */
+  globalStats() {
+    return db.globalStats()
   }
 }
 

@@ -168,13 +168,12 @@ if (ownerChatId) {
   ).catch(() => {})
 }
 
-// Mark configured admin users
+// Register admin users from env (admin status is checked by ID, not DB flag)
 for (const id of ALLOWED_USER_IDS) {
   if (!userManager.exists(id)) {
     userManager.register(id, { username: "admin", firstName: "Admin" })
   }
   userManager.approve(id)
-  userManager.setAdmin(id)
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -1025,117 +1024,208 @@ bot.on("photo", async (msg) => {
   }
 })
 
-// ── /setup — Connect Claude API key ─────────────────────────
-const awaitingApiKey = new Set()
+// ── /setup — Connect Claude (two options) ───────────────────
+const awaitingInput = new Map() // chatId -> "api_key" | "claude_email" | "claude_key_after_email"
 
 bot.onText(/\/setup/, (msg) => {
   const chatId = msg.chat.id
   const userId = msg.from.id
 
-  // Register user if new
   if (!userManager.exists(userId)) {
-    userManager.register(userId, {
-      username: msg.from.username,
-      firstName: msg.from.first_name,
-    })
+    userManager.register(userId, { username: msg.from.username, firstName: msg.from.first_name })
   }
 
   if (userManager.hasApiKey(userId)) {
+    const user = userManager.get(userId)
     bot.sendMessage(
       chatId,
-      `✅ You're already set up!\n\n` +
-        `Your Claude API key is connected.\n` +
-        `Use /removekey to disconnect.\n` +
-        `Use /myusage to see your stats.`,
+      `✅ You're already connected via *${user.auth_method === "claude_login" ? "Claude Login" : "API Key"}*\n\n` +
+        `/myusage — View your stats\n/removekey — Disconnect`,
+      { parse_mode: "Markdown" },
     )
     return
   }
 
-  awaitingApiKey.add(chatId)
-  bot.sendMessage(
-    chatId,
-    `🔑 *Connect Your Claude Account*\n\n` +
-      `To use this bot, you need your own Anthropic API key.\n\n` +
-      `1. Go to [console.anthropic.com](https://console.anthropic.com/)\n` +
-      `2. Create an API key\n` +
-      `3. Send it here (it'll be encrypted & stored securely)\n\n` +
-      `_Your key is encrypted at rest and only used when you send messages._\n` +
-      `_The bot owner cannot see your key._`,
-    { parse_mode: "Markdown", disable_web_page_preview: true },
-  )
+  bot.sendMessage(chatId, `🔑 *Connect Your Claude Account*\n\nChoose how to connect:`, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔑 I have an API Key", callback_data: "setup_apikey" }],
+        [{ text: "📧 Login with Claude Email", callback_data: "setup_email" }],
+      ],
+    },
+  })
 })
 
-// Catch API key input
-bot.on("message", (msg) => {
-  if (!awaitingApiKey.has(msg.chat.id)) return
+// Handle setup button clicks
+bot.on("callback_query", async (query) => {
+  if (!query.data?.startsWith("setup_")) return
+  const chatId = query.message.chat.id
+  const userId = query.from.id
+
+  await bot.answerCallbackQuery(query.id)
+
+  if (query.data === "setup_apikey") {
+    awaitingInput.set(chatId, "api_key")
+    await bot.sendMessage(
+      chatId,
+      `🔑 *Paste your Anthropic API Key*\n\n` +
+        `1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)\n` +
+        `2. Click "Create Key"\n` +
+        `3. Copy and paste it here\n\n` +
+        `_Your key will be deleted from chat & encrypted immediately._`,
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    )
+  }
+
+  if (query.data === "setup_email") {
+    awaitingInput.set(chatId, "claude_email")
+    await bot.sendMessage(
+      chatId,
+      `📧 *Claude Email Login*\n\n` +
+        `Send me the email you use for your Anthropic/Claude account.\n\n` +
+        `I'll guide you through getting your API key.\n` +
+        `_Your email is only used to verify your account — it's not stored._`,
+      { parse_mode: "Markdown" },
+    )
+  }
+
+  // Remove buttons
+  bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+    chat_id: chatId, message_id: query.message.message_id,
+  }).catch(() => {})
+})
+
+// Catch setup input (API key or email)
+bot.on("message", async (msg) => {
+  const mode = awaitingInput.get(msg.chat.id)
+  if (!mode) return
   if (msg.text?.startsWith("/")) return
   if (!msg.text) return
 
   const chatId = msg.chat.id
   const userId = msg.from.id
-  const key = msg.text.trim()
+  const input = msg.text.trim()
 
-  // Delete the message with the key immediately for security
+  // Always delete the message for security
   bot.deleteMessage(chatId, msg.message_id).catch(() => {})
 
-  awaitingApiKey.delete(chatId)
+  if (!userManager.exists(userId)) {
+    userManager.register(userId, { username: msg.from.username, firstName: msg.from.first_name })
+  }
 
-  // Validate key format (strict)
-  if (!isValidApiKeyFormat(key)) {
-    bot.sendMessage(chatId, `❌ Invalid API key format.\nIt should start with \`sk-ant-\` and be 40+ characters.\nGet one from console.anthropic.com\nTry /setup again.`)
+  // ── API Key flow ──────────────────────────────────────────
+  if (mode === "api_key" || mode === "claude_key_after_email") {
+    awaitingInput.delete(chatId)
+
+    if (!isValidApiKeyFormat(input)) {
+      bot.sendMessage(chatId, `❌ Invalid key format. Should start with \`sk-ant-\` (40+ chars).\nTry /setup again.`)
+      return
+    }
+
+    // Validate key actually works by making a test call
+    const validMsg = await bot.sendMessage(chatId, "🔄 _Validating your API key..._", { parse_mode: "Markdown" })
+
+    try {
+      const { default: Anthropic } = await import("@anthropic-ai/sdk")
+      const client = new Anthropic({ apiKey: input })
+      await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 10,
+        messages: [{ role: "user", content: "hi" }],
+      })
+
+      // Key works!
+      if (mode === "claude_key_after_email") {
+        userManager.setApiKeyFromLogin(userId, input)
+      } else {
+        userManager.setApiKey(userId, input)
+      }
+      userManager.approve(userId)
+
+      bot.editMessageText(
+        `✅ *Connected!* Your API key is valid and encrypted.\n\n` +
+          `You can now send messages to Claude.\n` +
+          `• /myusage — Your usage & costs\n` +
+          `• /removekey — Disconnect\n` +
+          `• /newchat — Fresh conversation`,
+        { chat_id: chatId, message_id: validMsg.message_id, parse_mode: "Markdown" },
+      )
+      logger.info("USER", `New user: ${msg.from.username || userId} (${mode})`)
+    } catch (err) {
+      bot.editMessageText(
+        `❌ *Key validation failed*\n\n` +
+          `The key didn't work. Check that:\n` +
+          `• It's copied correctly (starts with \`sk-ant-\`)\n` +
+          `• It has API access enabled\n` +
+          `• Your Anthropic account has credits\n\n` +
+          `Try /setup again.`,
+        { chat_id: chatId, message_id: validMsg.message_id, parse_mode: "Markdown" },
+      )
+    }
     return
   }
 
-  // Save encrypted key
-  if (!userManager.exists(userId)) {
-    userManager.register(userId, {
-      username: msg.from.username,
-      firstName: msg.from.first_name,
-    })
+  // ── Email flow ────────────────────────────────────────────
+  if (mode === "claude_email") {
+    awaitingInput.delete(chatId)
+
+    // Basic email validation
+    if (!input.includes("@") || !input.includes(".")) {
+      bot.sendMessage(chatId, "❌ That doesn't look like an email. Try /setup again.")
+      return
+    }
+
+    awaitingInput.set(chatId, "claude_key_after_email")
+    bot.sendMessage(
+      chatId,
+      `📧 *Great! Here's how to get your API key:*\n\n` +
+        `1. Go to [console.anthropic.com](https://console.anthropic.com/)\n` +
+        `2. Log in with: \`${input}\`\n` +
+        `3. Go to *Settings → API Keys*\n` +
+        `4. Click *"Create Key"*\n` +
+        `5. Copy the key and *paste it here*\n\n` +
+        `_Waiting for your API key..._`,
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    )
+    return
   }
-  userManager.setApiKey(userId, key)
-  userManager.approve(userId)
-
-  bot.sendMessage(
-    chatId,
-    `✅ *API key connected!*\n\n` +
-      `Your key has been encrypted and saved.\n` +
-      `You can now send messages to Claude.\n\n` +
-      `• /myusage — View your usage & spending\n` +
-      `• /removekey — Disconnect your key\n` +
-      `• /newchat — Start fresh conversation`,
-    { parse_mode: "Markdown" },
-  )
-
-  logger.info("USER", `New user setup: ${msg.from.username || userId}`)
 })
 
-// ── /myusage — View personal usage ──────────────────────────
+// ── /myusage — View personal usage (from DB) ────────────────
 bot.onText(/\/myusage/, (msg) => {
   const chatId = msg.chat.id
   const userId = msg.from.id
   const summary = userManager.getUsageSummary(userId)
 
-  if (!summary) {
+  if (!summary || summary.total_sessions === 0) {
     bot.sendMessage(chatId, "No usage data yet. Send a message to get started!")
     return
   }
 
-  const totalTokens = summary.totalInputTokens + summary.totalOutputTokens + summary.totalCacheTokens
+  const totalTokens = summary.total_input + summary.total_output + summary.total_cache
+  const avgCost = summary.total_sessions > 0 ? summary.total_cost / summary.total_sessions : 0
+
+  // Get daily breakdown
+  const daily = userManager.getDailyBreakdown(userId, 5)
+  const dailyLines = daily.map((d) =>
+    `  ${d.date}: ${d.sessions} sessions, $${d.cost_usd.toFixed(4)}, ${d.total_tokens.toLocaleString()} tok`,
+  ).join("\n")
 
   bot.sendMessage(
     chatId,
     `📊 *Your Usage*\n\n` +
-      `*Sessions:* ${summary.totalSessions}\n` +
-      `*Total cost:* $${summary.totalCostUsd.toFixed(4)}\n` +
-      `*Today:* $${summary.todayCostUsd.toFixed(4)}\n` +
-      `*Avg/session:* $${summary.avgCostPerSession.toFixed(4)}\n\n` +
+      `*Sessions:* ${summary.total_sessions}\n` +
+      `*Total cost:* $${summary.total_cost.toFixed(4)}\n` +
+      `*Today:* $${summary.today_cost.toFixed(4)}\n` +
+      `*Avg/session:* $${avgCost.toFixed(4)}\n\n` +
       `*Tokens:*\n` +
-      `  Input: ${summary.totalInputTokens.toLocaleString()}\n` +
-      `  Output: ${summary.totalOutputTokens.toLocaleString()}\n` +
-      `  Cache: ${summary.totalCacheTokens.toLocaleString()}\n` +
+      `  Input: ${summary.total_input.toLocaleString()}\n` +
+      `  Output: ${summary.total_output.toLocaleString()}\n` +
+      `  Cache: ${summary.total_cache.toLocaleString()}\n` +
       `  Total: ${totalTokens.toLocaleString()}\n\n` +
-      `*Last active:* ${summary.lastSessionAt ? new Date(summary.lastSessionAt).toLocaleString() : "Never"}`,
+      (dailyLines ? `*Last 5 Days:*\n${dailyLines}\n\n` : "") +
+      `*Last session:* ${summary.last_session || "Never"}`,
     { parse_mode: "Markdown" },
   )
 })
@@ -1143,73 +1233,64 @@ bot.onText(/\/myusage/, (msg) => {
 // ── /removekey — Remove API key ─────────────────────────────
 bot.onText(/\/removekey/, (msg) => {
   const chatId = msg.chat.id
-  const userId = msg.from.id
-
-  if (userManager.removeApiKey(userId)) {
-    bot.sendMessage(chatId, "🗑️ API key removed. Use /setup to connect a new one.")
-  } else {
-    bot.sendMessage(chatId, "No API key found.")
-  }
+  userManager.removeApiKey(msg.from.id)
+  bot.sendMessage(chatId, "🗑️ API key removed. Use /setup to connect a new one.")
 })
 
 // ── /users — Admin: list all users ──────────────────────────
 bot.onText(/\/users$/, (msg) => {
   const chatId = msg.chat.id
-  if (!isAdmin(msg.from.id)) {
-    bot.sendMessage(chatId, "⛔ Admin only.")
-    return
-  }
+  if (!isAdmin(msg.from.id)) { bot.sendMessage(chatId, "⛔ Admin only."); return }
 
   const users = userManager.listAll()
+  const stats = userManager.globalStats()
+
   if (users.length === 0) {
     bot.sendMessage(chatId, "No users registered yet.")
     return
   }
 
   const lines = users.map((u) => {
-    const status = u.isAdmin ? "👑" : u.isApproved ? "✅" : "⏳"
-    const key = u.hasKey ? "🔑" : "❌"
+    const status = ALLOWED_USER_IDS.includes(u.telegram_id) ? "👑" : u.is_approved ? "✅" : "⏳"
+    const key = u.has_key ? "🔑" : "❌"
+    const method = u.auth_method !== "none" ? ` (${u.auth_method})` : ""
     return (
-      `${status} *${u.firstName || u.username || u.telegramId}*\n` +
-      `  ID: \`${u.telegramId}\` | Key: ${key}\n` +
-      `  Sessions: ${u.totalSessions} | Cost: $${u.totalCostUsd.toFixed(4)}\n` +
-      `  Last: ${u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleDateString() : "Never"}`
+      `${status} *${u.first_name || u.username || u.telegram_id}*${method}\n` +
+      `  ID: \`${u.telegram_id}\` | Key: ${key}\n` +
+      `  Sessions: ${u.total_sessions} | Cost: $${(u.total_cost || 0).toFixed(4)}\n` +
+      `  Last: ${u.last_active_at || "Never"}`
     )
   })
 
   bot.sendMessage(
     chatId,
-    `👥 *Registered Users (${users.length})*\n\n${lines.join("\n\n")}\n\n` +
-      `👑 = Admin  ✅ = Approved  ⏳ = Pending\n🔑 = Has API key  ❌ = No key`,
+    `👥 *Users (${stats.total_users})* | 🔑 ${stats.users_with_keys} with keys\n` +
+      `💰 Total: $${stats.total_cost.toFixed(4)} | Today: $${stats.today_cost.toFixed(4)}\n` +
+      `📊 Sessions: ${stats.total_sessions} (${stats.today_sessions} today)\n\n` +
+      `${lines.join("\n\n")}\n\n` +
+      `👑 = Admin  ✅ = Approved  ⏳ = Pending`,
     { parse_mode: "Markdown" },
   )
 })
 
-// ── /approve — Admin: approve a user ────────────────────────
+// ── /approve — Admin: approve user ──────────────────────────
 bot.onText(/\/approve\s+(\d+)/, (msg, match) => {
   const chatId = msg.chat.id
-  if (!isAdmin(msg.from.id)) {
-    bot.sendMessage(chatId, "⛔ Admin only.")
-    return
-  }
+  if (!isAdmin(msg.from.id)) { bot.sendMessage(chatId, "⛔ Admin only."); return }
 
   const targetId = parseInt(match[1])
   if (userManager.approve(targetId)) {
     bot.sendMessage(chatId, `✅ User ${targetId} approved.`)
-    // Notify the user
-    bot.sendMessage(targetId, "✅ You've been approved! You can now use the bot.\nUse /setup to connect your Claude API key.").catch(() => {})
+    bot.sendMessage(targetId, "✅ You've been approved! Use /setup to connect your Claude API key.").catch(() => {})
   } else {
-    bot.sendMessage(chatId, `❌ User ${targetId} not found. They need to /start first.`)
+    bot.sendMessage(chatId, `❌ User ${targetId} not found.`)
   }
 })
 
-// ── /blockuser — Admin: block a user ────────────────────────
+// ── /blockuser — Admin: block user ──────────────────────────
 bot.onText(/\/blockuser\s+(\d+)/, (msg, match) => {
   const chatId = msg.chat.id
-  if (!isAdmin(msg.from.id)) {
-    bot.sendMessage(chatId, "⛔ Admin only.")
-    return
-  }
+  if (!isAdmin(msg.from.id)) { bot.sendMessage(chatId, "⛔ Admin only."); return }
 
   const targetId = parseInt(match[1])
   if (userManager.block(targetId)) {
