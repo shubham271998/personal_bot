@@ -7,6 +7,7 @@
 import scanner from "./market-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import trader from "./trader.mjs"
+import strategyEngine from "./strategy-engine.mjs"
 
 export function registerPolymarketCommands(bot, isAdminFn) {
   // ── /pm — Overview ────────────────────────────────────────
@@ -15,21 +16,25 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     bot.sendMessage(
       msg.chat.id,
       `Hey ${name}! Here's what I can do on Polymarket 📈\n\n` +
-        `*Markets:*\n` +
-        `/pmtop — Trending markets right now\n` +
-        `/pmsearch <query> — Find specific markets\n` +
-        `/pmopps — Markets with potential edge\n\n` +
-        `*Trading:*\n` +
-        `/pmbuy <market> <outcome> <$amount> — Place a bet\n` +
-        `/pmportfolio — Your current positions\n` +
-        `/pmhistory — Trade history\n` +
-        `/pmpnl — Your profit & loss\n\n` +
-        `*Analysis:*\n` +
-        `/pmnews <topic> — News analysis for a market\n` +
-        `/pmanalyze <market> — Deep analysis with edge detection\n\n` +
-        `*Settings:*\n` +
-        `/pmsettings — View/change trading settings\n\n` +
-        `_Currently in paper trading mode — no real money at risk!_`,
+        `*🧠 Smart Scanning:*\n` +
+        `/pmscan [bankroll] — Full 5-strategy scan (the big one)\n` +
+        `/pmsnipes — Safe bets (95%+ resolution snipes)\n` +
+        `/pmlongshots — High risk, 10x+ payoff bets\n\n` +
+        `*📊 Markets:*\n` +
+        `/pmtop — Trending markets\n` +
+        `/pmsearch <query> — Find markets\n` +
+        `/pmopps — Quick opportunity scan\n\n` +
+        `*📰 Research:*\n` +
+        `/pmnews <topic> — News sentiment analysis\n` +
+        `/pmanalyze <market> — Deep market analysis\n\n` +
+        `*💰 Trading:*\n` +
+        `/pmbuy <id> <outcome> <$amount> — Place a bet\n` +
+        `/pmportfolio — Your positions\n` +
+        `/pmpnl — Profit & loss\n` +
+        `/pmhistory — Trade log\n\n` +
+        `*⚙️ Settings:*\n` +
+        `/pmsettings — Trading config\n\n` +
+        `_Paper trading mode — no real money at risk!_`,
       { parse_mode: "Markdown" },
     )
   })
@@ -348,5 +353,132 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     const maxBet = parseInt(match[1])
     trader.updateSettings(msg.from.id, { maxBet })
     bot.sendMessage(msg.chat.id, `Max bet set to $${maxBet}`)
+  })
+
+  // ── /pmscan — Full strategy scan (the big one) ────────────
+  bot.onText(/\/pmscan\s*(\d*)/, async (msg, match) => {
+    const chatId = msg.chat.id
+    const bankroll = parseInt(match[1]) || 100
+    const name = msg.from.first_name || "Boss"
+
+    const loading = await bot.sendMessage(
+      chatId,
+      `🧠 _Running full market scan for you, ${name}..._\n\n` +
+        `Checking 5 strategies across 200+ markets.\n` +
+        `This takes 15-30 seconds.`,
+      { parse_mode: "Markdown" },
+    )
+
+    try {
+      const results = await strategyEngine.runFullScan(bankroll)
+
+      // Build the report
+      let report =
+        `🎯 *Market Scan Complete*\n` +
+        `💰 Bankroll: $${bankroll}\n` +
+        `📊 Allocation: 60% safe / 25% medium / 15% risky\n\n`
+
+      // Strategy summary
+      const strats = results.strategies
+      report +=
+        `*Strategies Found:*\n` +
+        `  🛡️ Resolution snipes: ${strats.resolutionSnipes || 0}\n` +
+        `  ⚖️ Arbitrage: ${strats.arbitrage || 0}\n` +
+        `  📰 News alpha: ${strats.newsAlpha || 0}\n` +
+        `  📈 Momentum: ${strats.momentum || 0}\n` +
+        `  🎰 Long shots: ${strats.longShots || 0}\n\n`
+
+      // Top picks
+      if (results.topPicks.length === 0) {
+        report += `_No strong signals right now. Markets look efficiently priced. I'll keep watching!_`
+      } else {
+        report += `*🔥 Top Picks:*\n\n`
+
+        for (let i = 0; i < Math.min(results.topPicks.length, 7); i++) {
+          const pick = results.topPicks[i]
+          const riskEmoji = pick.risk === "NONE" ? "⚖️" :
+            pick.risk === "LOW" ? "🛡️" :
+            pick.risk === "MEDIUM" ? "⚡" : "🎰"
+
+          report +=
+            `${i + 1}. ${riskEmoji} *${pick.strategy}*\n` +
+            `   ${pick.market.question.slice(0, 60)}\n` +
+            `   ${pick.reasoning.slice(0, 100)}\n` +
+            `   💵 Suggested: $${(pick.betSize || 0).toFixed(2)}\n\n`
+        }
+
+        report += `_Use /pmbuy <market_id> <outcome> <$amount> to trade_`
+      }
+
+      bot.editMessageText(report, {
+        chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown",
+      })
+    } catch (err) {
+      bot.editMessageText(`Scan failed: ${err.message}`, {
+        chat_id: chatId, message_id: loading.message_id,
+      })
+    }
+  })
+
+  // ── /pmsnipes — Resolution snipes only ────────────────────
+  bot.onText(/\/pmsnipes/, async (msg) => {
+    const chatId = msg.chat.id
+    const loading = await bot.sendMessage(chatId, "🛡️ _Scanning for safe resolution snipes..._", { parse_mode: "Markdown" })
+
+    try {
+      const snipes = await strategyEngine.findResolutionSnipes(0.90, 0.99)
+
+      if (snipes.length === 0) {
+        bot.editMessageText("No good snipes right now. Check back later!", {
+          chat_id: chatId, message_id: loading.message_id,
+        })
+        return
+      }
+
+      const lines = snipes.slice(0, 8).map((s, i) => {
+        const hoursText = s.hoursLeft !== "N/A" ? ` | ⏰ ${s.hoursLeft}h left` : ""
+        return `${i + 1}. *${s.market.question.slice(0, 55)}*\n` +
+          `   ${s.outcome}: ${(s.price * 100).toFixed(1)}% → +${s.profit}% profit${hoursText}\n` +
+          `   ID: \`${s.market.id}\``
+      })
+
+      bot.editMessageText(
+        `🛡️ *Resolution Snipes*\n_Buy near-certain outcomes for small guaranteed profit_\n\n${lines.join("\n\n")}`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+    }
+  })
+
+  // ── /pmlongshots — High risk, high reward ─────────────────
+  bot.onText(/\/pmlongshots/, async (msg) => {
+    const chatId = msg.chat.id
+    const loading = await bot.sendMessage(chatId, "🎰 _Scanning for long shots..._", { parse_mode: "Markdown" })
+
+    try {
+      const shots = await strategyEngine.findLongShots(0.15)
+
+      if (shots.length === 0) {
+        bot.editMessageText("No interesting long shots right now.", {
+          chat_id: chatId, message_id: loading.message_id,
+        })
+        return
+      }
+
+      const lines = shots.slice(0, 8).map((s, i) =>
+        `${i + 1}. *${s.market.question.slice(0, 55)}*\n` +
+          `   ${s.outcome}: ${(s.price * 100).toFixed(1)}% → *${s.payoff} return*\n` +
+          `   ID: \`${s.market.id}\``,
+      )
+
+      bot.editMessageText(
+        `🎰 *Long Shots*\n_Small bets, massive payoffs if they hit_\n\n${lines.join("\n\n")}\n\n` +
+          `_Only bet what you can afford to lose!_`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+    }
   })
 }
