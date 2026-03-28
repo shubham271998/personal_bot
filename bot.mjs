@@ -134,6 +134,29 @@ bot.setMyCommands([
   { command: "users", description: "See all users (admin)" },
   { command: "approve", description: "Approve someone (admin)" },
   { command: "blockuser", description: "Block someone (admin)" },
+  { command: "pm", description: "Polymarket — all commands" },
+  { command: "pmstart", description: "Start 24/7 market monitoring" },
+  { command: "pmstop", description: "Pause monitoring" },
+  { command: "pmscan", description: "Full strategy scan" },
+  { command: "pmtop", description: "Trending markets" },
+  { command: "pmsearch", description: "Search markets" },
+  { command: "pmsnipes", description: "Safe resolution plays" },
+  { command: "pmlongshots", description: "High risk, 10x+ bets" },
+  { command: "pmnegrisk", description: "NegRisk arbitrage (risk-free)" },
+  { command: "pmmaker", description: "Market making opportunities" },
+  { command: "pmnews", description: "News sentiment analysis" },
+  { command: "pmanalyze", description: "Deep market analysis" },
+  { command: "pmbuy", description: "Place a bet" },
+  { command: "pmportfolio", description: "Your positions" },
+  { command: "pmpnl", description: "Profit & loss" },
+  { command: "pmhistory", description: "Trade log" },
+  { command: "pmscorecard", description: "Virtual trading P&L scorecard" },
+  { command: "pmeval", description: "My prediction accuracy" },
+  { command: "pmauto", description: "Auto-watchlist" },
+  { command: "pmbriefing", description: "Market briefing now" },
+  { command: "pmwallet", description: "Check wallet balance" },
+  { command: "pmsettings", description: "Trading settings" },
+  { command: "pmrules", description: "Risk rules" },
 ])
 
 // Track the owner's chat ID — auto-detected from first message or from env
@@ -316,6 +339,13 @@ bot.onText(/\/pmrules/, (msg) => {
       `_"The goal is not to make the most money. It's to never go broke."_`,
     { parse_mode: "Markdown" },
   )
+})
+
+// ── /pmscorecard — Virtual trading performance ──────────────
+bot.onText(/\/pmscorecard/, (msg) => {
+  const chatId = msg.chat.id
+  const scorecard = autoAnalyst.generateScorecard()
+  bot.sendMessage(chatId, scorecard, { parse_mode: "Markdown" })
 })
 
 // ── /pmeval — See how well I'm predicting ───────────────────

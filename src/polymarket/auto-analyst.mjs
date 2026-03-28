@@ -393,6 +393,232 @@ export function getAutoWatchlist() {
   return stmts.getWatchlist.all()
 }
 
+// ── Virtual Trading Engine ──────────────────────────────────
+// Bot auto-trades with virtual $1000 bankroll, tracks everything
+
+db.raw.exec(`
+  CREATE TABLE IF NOT EXISTS pm_virtual_portfolio (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id    TEXT,
+    market_question TEXT,
+    outcome      TEXT,
+    side         TEXT,
+    entry_price  REAL,
+    shares       REAL,
+    size_usdc    REAL,
+    strategy     TEXT,
+    status       TEXT DEFAULT 'open',
+    exit_price   REAL,
+    pnl          REAL DEFAULT 0,
+    created_at   TEXT DEFAULT (datetime('now')),
+    closed_at    TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS pm_virtual_stats (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    date         TEXT UNIQUE,
+    starting_balance REAL,
+    ending_balance REAL,
+    trades_opened INTEGER DEFAULT 0,
+    trades_closed INTEGER DEFAULT 0,
+    wins         INTEGER DEFAULT 0,
+    losses       INTEGER DEFAULT 0,
+    day_pnl      REAL DEFAULT 0,
+    total_pnl    REAL DEFAULT 0,
+    win_rate     REAL DEFAULT 0,
+    best_trade   REAL DEFAULT 0,
+    worst_trade  REAL DEFAULT 0,
+    rating       TEXT DEFAULT '🔴'
+  );
+`)
+
+const virtualStmts = {
+  openPosition: db.raw.prepare(`
+    INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+  getOpenPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio WHERE status = 'open'`),
+  closePosition: db.raw.prepare(`
+    UPDATE pm_virtual_portfolio SET status = 'closed', exit_price = ?, pnl = ?, closed_at = datetime('now')
+    WHERE id = ?
+  `),
+  getAllPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio ORDER BY created_at DESC LIMIT ?`),
+  getVirtualPnL: db.raw.prepare(`
+    SELECT COALESCE(SUM(pnl), 0) as total_pnl,
+           COUNT(*) as total_trades,
+           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+           SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+           MAX(pnl) as best_trade,
+           MIN(pnl) as worst_trade,
+           COALESCE(SUM(size_usdc), 0) as total_volume
+    FROM pm_virtual_portfolio WHERE status = 'closed'
+  `),
+  getTodayPnL: db.raw.prepare(`
+    SELECT COALESCE(SUM(pnl), 0) as day_pnl, COUNT(*) as trades
+    FROM pm_virtual_portfolio WHERE status = 'closed' AND date(closed_at) = date('now')
+  `),
+  getOpenValue: db.raw.prepare(`
+    SELECT COALESCE(SUM(size_usdc), 0) as total_invested FROM pm_virtual_portfolio WHERE status = 'open'
+  `),
+  upsertDailyStats: db.raw.prepare(`
+    INSERT INTO pm_virtual_stats (date, starting_balance, ending_balance, trades_opened, trades_closed, wins, losses, day_pnl, total_pnl, win_rate, best_trade, worst_trade, rating)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date) DO UPDATE SET ending_balance=excluded.ending_balance, trades_closed=excluded.trades_closed,
+    wins=excluded.wins, losses=excluded.losses, day_pnl=excluded.day_pnl, total_pnl=excluded.total_pnl,
+    win_rate=excluded.win_rate, best_trade=excluded.best_trade, worst_trade=excluded.worst_trade, rating=excluded.rating
+  `),
+  getDailyStats: db.raw.prepare(`SELECT * FROM pm_virtual_stats ORDER BY date DESC LIMIT ?`),
+}
+
+const VIRTUAL_BANKROLL = 1000
+const VIRTUAL_MAX_BET = 50 // $50 max per trade
+const VIRTUAL_MAX_OPEN = 10 // Max 10 open positions
+
+/**
+ * Auto-trade based on scan results — bot decides and executes virtually
+ */
+async function autoVirtualTrade(scanResults) {
+  const openPositions = virtualStmts.getOpenPositions.all()
+  const openValue = virtualStmts.getOpenValue.get()?.total_invested || 0
+  const availableCapital = VIRTUAL_BANKROLL - openValue
+  let tradesPlaced = 0
+
+  for (const pick of scanResults.topPicks) {
+    if (openPositions.length + tradesPlaced >= VIRTUAL_MAX_OPEN) break
+    if (pick.score < 2) continue // Only trade high-conviction picks
+    if (!pick.market?.id) continue
+
+    // Don't double up on same market
+    if (openPositions.some((p) => p.market_id === pick.market.id)) continue
+
+    // Calculate bet size
+    let betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET, availableCapital * 0.1)
+    if (betSize < 1) continue
+
+    const outcome = pick.outcome || pick.market.outcomes?.[0]?.name || "YES"
+    const price = pick.currentPrice || pick.price || 0.5
+    const shares = betSize / price
+
+    try {
+      virtualStmts.openPosition.run(
+        pick.market.id,
+        (pick.market.question || "").slice(0, 200),
+        outcome,
+        pick.direction || "BUY",
+        price,
+        shares,
+        betSize,
+        pick.strategy || "Auto",
+      )
+      tradesPlaced++
+    } catch {}
+  }
+
+  return tradesPlaced
+}
+
+/**
+ * Check open virtual positions and close resolved ones
+ */
+async function checkVirtualPositions() {
+  const openPositions = virtualStmts.getOpenPositions.all()
+  const closed = []
+
+  for (const pos of openPositions) {
+    try {
+      const market = await scanner.getMarket(pos.market_id)
+      if (!market) continue
+
+      // Market resolved
+      if (!market.active) {
+        const resolvedPrice = market.outcomes.find((o) =>
+          o.name.toLowerCase().includes(pos.outcome.toLowerCase()),
+        )?.price || 0
+
+        const exitPrice = resolvedPrice >= 0.99 ? 1.0 : resolvedPrice <= 0.01 ? 0.0 : resolvedPrice
+        const pnl = (exitPrice - pos.entry_price) * pos.shares
+
+        virtualStmts.closePosition.run(exitPrice, pnl, pos.id)
+        closed.push({ ...pos, exit_price: exitPrice, pnl })
+        continue
+      }
+
+      // Stop loss check for medium/high risk
+      const currentPrice = market.outcomes.find((o) =>
+        o.name.toLowerCase().includes(pos.outcome.toLowerCase()),
+      )?.price || pos.entry_price
+
+      if (pos.strategy !== "Resolution Snipe" && pos.strategy !== "Arbitrage") {
+        const lossThreshold = pos.entry_price * 0.70 // -30% stop
+        if (currentPrice < lossThreshold) {
+          const pnl = (currentPrice - pos.entry_price) * pos.shares
+          virtualStmts.closePosition.run(currentPrice, pnl, pos.id)
+          closed.push({ ...pos, exit_price: currentPrice, pnl })
+        }
+      }
+    } catch { continue }
+  }
+
+  return closed
+}
+
+/**
+ * Generate daily scorecard
+ */
+function generateScorecard() {
+  const pnl = virtualStmts.getVirtualPnL.get()
+  const today = virtualStmts.getTodayPnL.get()
+  const openPositions = virtualStmts.getOpenPositions.all()
+  const openValue = virtualStmts.getOpenValue.get()?.total_invested || 0
+
+  const totalPnL = pnl?.total_pnl || 0
+  const currentBalance = VIRTUAL_BANKROLL + totalPnL
+  const winRate = pnl?.total_trades > 0 ? (pnl.wins / pnl.total_trades * 100) : 0
+  const roi = (totalPnL / VIRTUAL_BANKROLL * 100)
+
+  let rating = "🔴 Learning"
+  if (winRate >= 50 && totalPnL > 0) rating = "🟡 Getting there"
+  if (winRate >= 60 && totalPnL > 50) rating = "🟢 Profitable"
+  if (winRate >= 70 && totalPnL > 200) rating = "⭐ Crushing it"
+  if (winRate >= 80 && totalPnL > 500) rating = "💎 Elite"
+
+  // Save daily stats
+  const date = new Date().toISOString().split("T")[0]
+  virtualStmts.upsertDailyStats.run(
+    date, VIRTUAL_BANKROLL, currentBalance,
+    0, pnl?.total_trades || 0, pnl?.wins || 0, pnl?.losses || 0,
+    today?.day_pnl || 0, totalPnL, winRate,
+    pnl?.best_trade || 0, pnl?.worst_trade || 0, rating,
+  )
+
+  // Open positions summary
+  const posLines = openPositions.slice(0, 5).map((p) =>
+    `  • ${p.outcome.slice(0, 20)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
+  ).join("\n")
+
+  return `💰 *Virtual Trading Scorecard*\n\n` +
+    `*Balance:* $${currentBalance.toFixed(2)} (started $${VIRTUAL_BANKROLL})\n` +
+    `*Total P&L:* ${totalPnL >= 0 ? "+" : ""}$${totalPnL.toFixed(2)} (${roi >= 0 ? "+" : ""}${roi.toFixed(1)}%)\n` +
+    `*Today:* ${(today?.day_pnl || 0) >= 0 ? "+" : ""}$${(today?.day_pnl || 0).toFixed(2)}\n\n` +
+    `*Stats:*\n` +
+    `  Trades: ${pnl?.total_trades || 0} (${pnl?.wins || 0}W / ${pnl?.losses || 0}L)\n` +
+    `  Win rate: ${winRate.toFixed(0)}%\n` +
+    `  Best trade: +$${(pnl?.best_trade || 0).toFixed(2)}\n` +
+    `  Worst trade: $${(pnl?.worst_trade || 0).toFixed(2)}\n` +
+    `  Volume: $${(pnl?.total_volume || 0).toFixed(2)}\n\n` +
+    `*Rating:* ${rating}\n\n` +
+    (openPositions.length > 0 ? `*Open Positions (${openPositions.length}):*\n${posLines}\n\n` : "") +
+    `*Capital:* $${(currentBalance - openValue).toFixed(2)} free / $${openValue.toFixed(2)} invested\n` +
+    `_Virtual money — tracking to prove the system works before going live_`
+}
+
+/**
+ * Get daily stats history
+ */
+export function getDailyHistory(days = 7) {
+  return virtualStmts.getDailyStats.all(days)
+}
+
 // ── Proactive Analysis Loop ─────────────────────────────────
 
 let _bot = null
@@ -400,6 +626,8 @@ let _chatId = null
 let _briefingInterval = null
 let _evalInterval = null
 let _watchlistInterval = null
+let _virtualTradeInterval = null
+let _scorecardInterval = null
 let _isRunning = false
 
 export function init(bot, chatId) {
@@ -409,31 +637,32 @@ export function init(bot, chatId) {
 
 /**
  * Start the autonomous analyst
- * - Sends briefing every 2 hours
- * - Evaluates predictions every 30 min
- * - Auto-manages watchlist every 15 min
- * - Records predictions from every scan
  */
 export function startAutonomous() {
   if (_isRunning) return false
   _isRunning = true
 
-  console.log("[AUTO-ANALYST] Started autonomous mode")
+  console.log("[AUTO-ANALYST] Started autonomous mode with virtual trading")
 
-  // Initial briefing after 30 seconds (let other things load)
+  // Initial briefing after 30 seconds
   setTimeout(() => sendBriefing(), 30000)
 
   // Briefing every 2 hours
   _briefingInterval = setInterval(() => sendBriefing(), 2 * 60 * 60 * 1000)
+
+  // Virtual trade + evaluate every 10 minutes
+  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 10 * 60 * 1000)
+  setTimeout(() => runVirtualTradingCycle(), 60000) // First run after 1 min
 
   // Evaluate predictions every 30 minutes
   _evalInterval = setInterval(() => runEvaluation(), 30 * 60 * 1000)
 
   // Auto-manage watchlist every 15 minutes
   _watchlistInterval = setInterval(() => runWatchlistUpdate(), 15 * 60 * 1000)
-
-  // Initial watchlist setup
   setTimeout(() => runWatchlistUpdate(), 10000)
+
+  // Daily scorecard at end of day (every 6 hours to not miss it)
+  _scorecardInterval = setInterval(() => sendScorecard(), 6 * 60 * 60 * 1000)
 
   return true
 }
@@ -444,6 +673,8 @@ export function stopAutonomous() {
   if (_briefingInterval) clearInterval(_briefingInterval)
   if (_evalInterval) clearInterval(_evalInterval)
   if (_watchlistInterval) clearInterval(_watchlistInterval)
+  if (_virtualTradeInterval) clearInterval(_virtualTradeInterval)
+  if (_scorecardInterval) clearInterval(_scorecardInterval)
   console.log("[AUTO-ANALYST] Stopped")
   return true
 }
@@ -518,11 +749,73 @@ async function runWatchlistUpdate() {
   }
 }
 
+async function runVirtualTradingCycle() {
+  if (!_bot || !_chatId) return
+  try {
+    // 1. Check and close resolved positions
+    const closed = await checkVirtualPositions()
+    if (closed.length > 0) {
+      const lines = closed.map((c) => {
+        const icon = c.pnl >= 0 ? "✅" : "❌"
+        return `${icon} ${c.outcome.slice(0, 30)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}`
+      })
+      await _bot.sendMessage(
+        _chatId,
+        `💰 *Positions Closed*\n\n${lines.join("\n")}\n\n_Virtual trading — tracking performance_`,
+        { parse_mode: "Markdown" },
+      )
+    }
+
+    // 2. Run strategy scan and auto-trade new picks
+    const scan = await strategyEngine.runFullScan(VIRTUAL_BANKROLL)
+    const tradesPlaced = await autoVirtualTrade(scan)
+
+    if (tradesPlaced > 0) {
+      const openPositions = virtualStmts.getOpenPositions.all()
+      const recent = openPositions.slice(-tradesPlaced)
+      const lines = recent.map((p) =>
+        `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
+      )
+      await _bot.sendMessage(
+        _chatId,
+        `📝 *Auto-Traded ${tradesPlaced} positions*\n\n${lines.join("\n")}\n\n_Virtual $${VIRTUAL_BANKROLL} bankroll_`,
+        { parse_mode: "Markdown" },
+      )
+    }
+
+    // 3. Record predictions for picks
+    for (const pick of scan.topPicks.slice(0, 5)) {
+      if (pick.market?.id) {
+        const outcome = pick.outcome || pick.market.outcomes?.[0]?.name || "YES"
+        const prob = pick.estimatedProb || pick.price || 0.5
+        recordPrediction(
+          pick.market.id, pick.market.question?.slice(0, 200) || "",
+          outcome, prob, pick.currentPrice || pick.price || 0.5,
+          pick.score / 10, pick.reasoning?.slice(0, 300) || "",
+        )
+      }
+    }
+  } catch (err) {
+    console.error("[AUTO-ANALYST] Virtual trading error:", err.message)
+  }
+}
+
+async function sendScorecard() {
+  if (!_bot || !_chatId) return
+  try {
+    const scorecard = generateScorecard()
+    await _bot.sendMessage(_chatId, scorecard, { parse_mode: "Markdown" })
+  } catch (err) {
+    console.error("[AUTO-ANALYST] Scorecard error:", err.message)
+  }
+}
+
 export default {
   init,
   startAutonomous,
   stopAutonomous,
   generateBriefing,
+  generateScorecard,
   analyzeMarketSimple,
   recordPrediction,
   evaluateOpenPredictions,
@@ -530,4 +823,5 @@ export default {
   saveEvalScore,
   autoManageWatchlist,
   getAutoWatchlist,
+  getDailyHistory,
 }
