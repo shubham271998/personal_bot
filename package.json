@@ -9,12 +9,14 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
+    "@polymarket/clob-client": "^5.8.1",
     "axios": "^1.14.0",
     "better-sqlite3": "^12.8.0",
     "dotenv": "^17.3.1",
     "ethers": "^6.16.0",
     "node-telegram-bot-api": "^0.66.0",
     "onnxruntime-node": "^1.24.3",
-    "sharp": "^0.33.2"
+    "sharp": "^0.33.2",
+    "ws": "^8.20.0"
   }
 }

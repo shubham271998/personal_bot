@@ -22,6 +22,7 @@ import strategyEngine from "./strategy-engine.mjs"
 import marketMaker from "./market-maker.mjs"
 import scanner from "./market-scanner.mjs"
 import trader from "./trader.mjs"
+import stream from "./realtime-stream.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const SCAN_INTERVAL_MS = 5 * 60 * 1000  // Full scan every 5 min
@@ -58,13 +59,45 @@ export function init(bot, chatId) {
 /**
  * Start the always-on monitor
  */
-export function start(bankroll = 100) {
+export async function start(bankroll = 100) {
   if (_isRunning) return false
   _isRunning = true
 
   console.log(`[PM-MONITOR] Started with $${bankroll} bankroll`)
 
-  // Run immediately, then on interval
+  // Connect WebSocket for real-time price data
+  try {
+    const topMarkets = await scanner.getTopMarkets(10)
+    const tokenIds = topMarkets
+      .flatMap((m) => m.outcomes.map((o) => o.tokenId))
+      .filter(Boolean)
+
+    stream.onPriceChange = (tokenId, price) => {
+      const watched = _watchlist.get(tokenId)
+      if (watched && !watched.alertSent) {
+        const triggered = watched.direction === "above"
+          ? price >= watched.targetPrice
+          : price <= watched.targetPrice
+        if (triggered) {
+          watched.alertSent = true
+          sendAlert(`🔔 *Price Alert!*\n${watched.market.question.slice(0, 60)}\nHit ${(price * 100).toFixed(1)}%`)
+        }
+      }
+    }
+
+    stream.onTrade = (tradeData) => {
+      if (tradeData?.size > 10000) {
+        sendAlert(`🐋 *Whale Trade:* $${(tradeData.size / 1000).toFixed(0)}K detected`)
+      }
+    }
+
+    stream.connectCLOB(tokenIds)
+    console.log(`[PM-MONITOR] WebSocket streaming ${tokenIds.length} tokens`)
+  } catch (err) {
+    console.error("[PM-MONITOR] WebSocket failed, using polling:", err.message)
+  }
+
+  // Run strategy scans on interval
   runFullScan(bankroll)
   _scanInterval = setInterval(() => runFullScan(bankroll), SCAN_INTERVAL_MS)
   _priceInterval = setInterval(() => checkWatchlist(), PRICE_CHECK_MS)
@@ -83,6 +116,9 @@ export function stop() {
   if (_priceInterval) clearInterval(_priceInterval)
   _scanInterval = null
   _priceInterval = null
+
+  // Disconnect WebSocket streams
+  stream.disconnect()
 
   console.log("[PM-MONITOR] Stopped")
   return true
