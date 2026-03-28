@@ -1,0 +1,16 @@
+{
+  "name": "telegram-claude-bot",
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.mjs",
+    "guard": "node src/security-guard.mjs",
+    "setup-guard": "node src/setup-guard.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "onnxruntime-node": "^1.24.3",
+    "sharp": "^0.33.2"
+  }
+}
