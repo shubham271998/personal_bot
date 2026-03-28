@@ -499,26 +499,41 @@ async function autoVirtualTrade(scanResults) {
   const availableCapital = VIRTUAL_BANKROLL - openValue
   let tradesPlaced = 0
 
+  console.log(`[VIRTUAL] Scan found ${scanResults.topPicks.length} picks. Open: ${openPositions.length}/${VIRTUAL_MAX_OPEN}. Capital: $${availableCapital.toFixed(2)}`)
+
   for (const pick of scanResults.topPicks) {
     if (openPositions.length + tradesPlaced >= VIRTUAL_MAX_OPEN) break
-    if (pick.score < 2) continue // Only trade high-conviction picks
+    if (pick.score < 0.5) continue // Trade anything with positive score
     if (!pick.market?.id) continue
 
     // Don't double up on same market
     if (openPositions.some((p) => p.market_id === pick.market.id)) continue
 
-    // Calculate bet size
-    let betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET, availableCapital * 0.1)
-    if (betSize < 1) continue
+    // Calculate bet size — use $5 minimum for virtual trades
+    let betSize = Math.max(5, Math.min(pick.betSize || 10, VIRTUAL_MAX_BET, availableCapital * 0.1))
+    if (availableCapital < betSize) continue
 
-    const outcome = pick.outcome || pick.market.outcomes?.[0]?.name || "YES"
-    const price = pick.currentPrice || pick.price || 0.5
+    // Get proper outcome and price based on strategy type
+    let outcome, price
+    if (pick.strategy === "NegRisk Arbitrage") {
+      outcome = pick.direction || "ARBITRAGE"
+      price = pick.event?.totalYesPrice || 0.95
+    } else {
+      outcome = pick.outcome || pick.market?.outcomes?.[0]?.name || "YES"
+      price = pick.currentPrice || pick.price || 0
+    }
+    if (price <= 0.01 || price >= 0.99) continue
     const shares = betSize / price
+    const marketId = pick.market?.id || pick.event?.eventId || ""
+    const question = pick.market?.question || pick.event?.title || ""
+
+    // Skip if no market identifier
+    if (!marketId) continue
 
     try {
       virtualStmts.openPosition.run(
-        pick.market.id,
-        (pick.market.question || "").slice(0, 200),
+        marketId,
+        question.slice(0, 200),
         outcome,
         pick.direction || "BUY",
         price,
@@ -527,7 +542,10 @@ async function autoVirtualTrade(scanResults) {
         pick.strategy || "Auto",
       )
       tradesPlaced++
-    } catch {}
+      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy})`)
+    } catch (err) {
+      console.error(`[VIRTUAL] Trade failed:`, err.message)
+    }
   }
 
   return tradesPlaced
@@ -764,7 +782,8 @@ async function runWatchlistUpdate() {
 }
 
 async function runVirtualTradingCycle() {
-  if (!_bot || !_chatId) return
+  if (!_bot || !_chatId) { console.log("[VIRTUAL] Skipped — no bot/chatId"); return }
+  console.log("[VIRTUAL] Running trading cycle...")
   try {
     // 1. Check and close resolved positions
     const closed = await checkVirtualPositions()
@@ -793,17 +812,22 @@ async function runVirtualTradingCycle() {
       )
     }
 
-    // 3. Record predictions for picks
+    // 3. Record predictions for picks (with real prices)
     for (const pick of scan.topPicks.slice(0, 5)) {
-      if (pick.market?.id) {
-        const outcome = pick.outcome || pick.market.outcomes?.[0]?.name || "YES"
-        const prob = pick.estimatedProb || pick.price || 0.5
-        recordPrediction(
-          pick.market.id, pick.market.question?.slice(0, 200) || "",
-          outcome, prob, pick.currentPrice || pick.price || 0.5,
-          pick.score / 10, pick.reasoning?.slice(0, 300) || "",
-        )
-      }
+      const mId = pick.market?.id || pick.event?.eventId
+      if (!mId) continue
+
+      const outcome = pick.outcome || pick.market?.outcomes?.[0]?.name || "YES"
+      const marketPrice = pick.currentPrice || pick.price || pick.market?.outcomes?.[0]?.price || 0.5
+      // Our estimated probability: if we're buying, we think it's higher than market
+      const estimatedProb = pick.estimatedProb || (pick.direction === "BUY_YES" ? Math.min(0.95, marketPrice + 0.15) : marketPrice)
+      const question = pick.market?.question || pick.event?.title || ""
+
+      recordPrediction(
+        mId, question.slice(0, 200),
+        outcome, estimatedProb, marketPrice,
+        Math.min(1, pick.score / 10), pick.reasoning?.slice(0, 300) || "",
+      )
     }
   } catch (err) {
     console.error("[AUTO-ANALYST] Virtual trading error:", err.message)

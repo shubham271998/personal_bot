@@ -219,10 +219,29 @@ function isAdmin(userId) {
 // Register Polymarket trading commands
 registerPolymarketCommands(bot, isAdmin)
 
-// Initialize live monitor + auto-analyst with bot instance
+// Initialize and AUTO-START live monitor + auto-analyst on boot
 if (ownerChatId) {
   liveMonitor.init(bot, ownerChatId)
   autoAnalyst.init(bot, ownerChatId)
+
+  // Auto-start everything — no need to /pmstart manually
+  setTimeout(async () => {
+    try {
+      liveMonitor.start(1000)
+      autoAnalyst.startAutonomous()
+      console.log("[PM] Auto-started: monitor + analyst + virtual trading ($1000 bankroll)")
+      bot.sendMessage(ownerChatId,
+        `📈 *Markets are live!*\n\n` +
+          `Auto-started with $1000 virtual bankroll.\n` +
+          `Scanning, trading, and evaluating 24/7.\n\n` +
+          `/pmscorecard — see my virtual P&L\n` +
+          `/pmeval — my prediction accuracy`,
+        { parse_mode: "Markdown" },
+      ).catch(() => {})
+    } catch (err) {
+      console.error("[PM] Auto-start failed:", err.message)
+    }
+  }, 15000) // Wait 15s for bot to fully initialize
 }
 
 // ── /pmstart — Start live monitoring ────────────────────────
