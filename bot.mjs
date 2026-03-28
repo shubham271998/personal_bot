@@ -20,6 +20,7 @@ import { fileURLToPath } from "url"
 import { spawn as spawnProc } from "child_process"
 import { checkRateLimit } from "./src/rate-limiter.mjs"
 import { sanitizeForShell, validateSystemCommand, sanitizePrompt } from "./src/input-sanitizer.mjs"
+import userManager from "./src/user-manager.mjs"
 import logger from "./src/logger.mjs"
 import projectManager from "./src/projects.mjs"
 import {
@@ -118,6 +119,12 @@ bot.setMyCommands([
   { command: "guardsetface", description: "Set reference face photo" },
   { command: "sys", description: "System command: /sys sleep|shutdown|volume|battery|..." },
   { command: "permit", description: "Check & grant macOS permissions" },
+  { command: "setup", description: "Connect your Claude API key" },
+  { command: "myusage", description: "View your usage & spending" },
+  { command: "removekey", description: "Remove your API key" },
+  { command: "users", description: "(Admin) List all users" },
+  { command: "approve", description: "(Admin) Approve user: /approve <id>" },
+  { command: "blockuser", description: "(Admin) Block user: /blockuser <id>" },
 ])
 
 // Track the owner's chat ID — auto-detected from first message or from env
@@ -155,10 +162,26 @@ if (ownerChatId) {
   ).catch(() => {})
 }
 
+// Mark configured admin users
+for (const id of ALLOWED_USER_IDS) {
+  if (!userManager.exists(id)) {
+    userManager.register(id, { username: "admin", firstName: "Admin" })
+  }
+  userManager.approve(id)
+  userManager.setAdmin(id)
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 function isAllowed(userId) {
-  if (ALLOWED_USER_IDS.length === 0) return true
-  return ALLOWED_USER_IDS.includes(userId)
+  // Admins from ALLOWED_TELEGRAM_IDS always allowed
+  if (ALLOWED_USER_IDS.includes(userId)) return true
+  // Registered + approved users with API key are allowed
+  const user = userManager.get(userId)
+  return user?.isApproved && userManager.hasApiKey(userId)
+}
+
+function isAdmin(userId) {
+  return ALLOWED_USER_IDS.includes(userId) || userManager.isAdmin(userId)
 }
 
 function splitMessage(text) {
@@ -214,11 +237,29 @@ bot.onText(/\/start/, (msg) => {
     logger.info("BOT", `Owner chat ID auto-detected: ${chatId}`)
   }
 
+  // Register user on /start
+  if (!userManager.exists(userId)) {
+    userManager.register(userId, {
+      username: msg.from.username,
+      firstName: msg.from.first_name,
+    })
+  }
+
+  const hasKey = userManager.hasApiKey(userId)
+  const setupHint = hasKey
+    ? `✅ Claude connected`
+    : `⚠️ Not connected — use /setup to link your Claude API key`
+
   bot.sendMessage(
     chatId,
     `🤖 *Claude Code Bot v2.0*\n\n` +
       `Your ID: \`${userId}\`\n` +
-      `Active project: \`${project?.name || "none"}\` → \`${project?.path || "not set"}\`\n\n` +
+      `${setupHint}\n` +
+      `Active project: \`${project?.name || "none"}\`\n\n` +
+      `*Getting Started:*\n` +
+      `/setup — Connect your Claude API key\n` +
+      `/myusage — View your usage & costs\n` +
+      `/removekey — Disconnect your key\n\n` +
       `*General Commands:*\n` +
       `/ask <prompt> — Ask Claude about the project\n` +
       `/newchat — Start fresh conversation\n` +
@@ -976,6 +1017,200 @@ bot.on("photo", async (msg) => {
   }
 })
 
+// ── /setup — Connect Claude API key ─────────────────────────
+const awaitingApiKey = new Set()
+
+bot.onText(/\/setup/, (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+
+  // Register user if new
+  if (!userManager.exists(userId)) {
+    userManager.register(userId, {
+      username: msg.from.username,
+      firstName: msg.from.first_name,
+    })
+  }
+
+  if (userManager.hasApiKey(userId)) {
+    bot.sendMessage(
+      chatId,
+      `✅ You're already set up!\n\n` +
+        `Your Claude API key is connected.\n` +
+        `Use /removekey to disconnect.\n` +
+        `Use /myusage to see your stats.`,
+    )
+    return
+  }
+
+  awaitingApiKey.add(chatId)
+  bot.sendMessage(
+    chatId,
+    `🔑 *Connect Your Claude Account*\n\n` +
+      `To use this bot, you need your own Anthropic API key.\n\n` +
+      `1. Go to [console.anthropic.com](https://console.anthropic.com/)\n` +
+      `2. Create an API key\n` +
+      `3. Send it here (it'll be encrypted & stored securely)\n\n` +
+      `_Your key is encrypted at rest and only used when you send messages._\n` +
+      `_The bot owner cannot see your key._`,
+    { parse_mode: "Markdown", disable_web_page_preview: true },
+  )
+})
+
+// Catch API key input
+bot.on("message", (msg) => {
+  if (!awaitingApiKey.has(msg.chat.id)) return
+  if (msg.text?.startsWith("/")) return
+  if (!msg.text) return
+
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  const key = msg.text.trim()
+
+  // Delete the message with the key immediately for security
+  bot.deleteMessage(chatId, msg.message_id).catch(() => {})
+
+  awaitingApiKey.delete(chatId)
+
+  // Validate key format
+  if (!key.startsWith("sk-ant-")) {
+    bot.sendMessage(chatId, `❌ That doesn't look like an Anthropic API key.\nIt should start with \`sk-ant-\`.\nTry /setup again.`)
+    return
+  }
+
+  // Save encrypted key
+  if (!userManager.exists(userId)) {
+    userManager.register(userId, {
+      username: msg.from.username,
+      firstName: msg.from.first_name,
+    })
+  }
+  userManager.setApiKey(userId, key)
+  userManager.approve(userId)
+
+  bot.sendMessage(
+    chatId,
+    `✅ *API key connected!*\n\n` +
+      `Your key has been encrypted and saved.\n` +
+      `You can now send messages to Claude.\n\n` +
+      `• /myusage — View your usage & spending\n` +
+      `• /removekey — Disconnect your key\n` +
+      `• /newchat — Start fresh conversation`,
+    { parse_mode: "Markdown" },
+  )
+
+  logger.info("USER", `New user setup: ${msg.from.username || userId}`)
+})
+
+// ── /myusage — View personal usage ──────────────────────────
+bot.onText(/\/myusage/, (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+  const summary = userManager.getUsageSummary(userId)
+
+  if (!summary) {
+    bot.sendMessage(chatId, "No usage data yet. Send a message to get started!")
+    return
+  }
+
+  const totalTokens = summary.totalInputTokens + summary.totalOutputTokens + summary.totalCacheTokens
+
+  bot.sendMessage(
+    chatId,
+    `📊 *Your Usage*\n\n` +
+      `*Sessions:* ${summary.totalSessions}\n` +
+      `*Total cost:* $${summary.totalCostUsd.toFixed(4)}\n` +
+      `*Today:* $${summary.todayCostUsd.toFixed(4)}\n` +
+      `*Avg/session:* $${summary.avgCostPerSession.toFixed(4)}\n\n` +
+      `*Tokens:*\n` +
+      `  Input: ${summary.totalInputTokens.toLocaleString()}\n` +
+      `  Output: ${summary.totalOutputTokens.toLocaleString()}\n` +
+      `  Cache: ${summary.totalCacheTokens.toLocaleString()}\n` +
+      `  Total: ${totalTokens.toLocaleString()}\n\n` +
+      `*Last active:* ${summary.lastSessionAt ? new Date(summary.lastSessionAt).toLocaleString() : "Never"}`,
+    { parse_mode: "Markdown" },
+  )
+})
+
+// ── /removekey — Remove API key ─────────────────────────────
+bot.onText(/\/removekey/, (msg) => {
+  const chatId = msg.chat.id
+  const userId = msg.from.id
+
+  if (userManager.removeApiKey(userId)) {
+    bot.sendMessage(chatId, "🗑️ API key removed. Use /setup to connect a new one.")
+  } else {
+    bot.sendMessage(chatId, "No API key found.")
+  }
+})
+
+// ── /users — Admin: list all users ──────────────────────────
+bot.onText(/\/users$/, (msg) => {
+  const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) {
+    bot.sendMessage(chatId, "⛔ Admin only.")
+    return
+  }
+
+  const users = userManager.listAll()
+  if (users.length === 0) {
+    bot.sendMessage(chatId, "No users registered yet.")
+    return
+  }
+
+  const lines = users.map((u) => {
+    const status = u.isAdmin ? "👑" : u.isApproved ? "✅" : "⏳"
+    const key = u.hasKey ? "🔑" : "❌"
+    return (
+      `${status} *${u.firstName || u.username || u.telegramId}*\n` +
+      `  ID: \`${u.telegramId}\` | Key: ${key}\n` +
+      `  Sessions: ${u.totalSessions} | Cost: $${u.totalCostUsd.toFixed(4)}\n` +
+      `  Last: ${u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleDateString() : "Never"}`
+    )
+  })
+
+  bot.sendMessage(
+    chatId,
+    `👥 *Registered Users (${users.length})*\n\n${lines.join("\n\n")}\n\n` +
+      `👑 = Admin  ✅ = Approved  ⏳ = Pending\n🔑 = Has API key  ❌ = No key`,
+    { parse_mode: "Markdown" },
+  )
+})
+
+// ── /approve — Admin: approve a user ────────────────────────
+bot.onText(/\/approve\s+(\d+)/, (msg, match) => {
+  const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) {
+    bot.sendMessage(chatId, "⛔ Admin only.")
+    return
+  }
+
+  const targetId = parseInt(match[1])
+  if (userManager.approve(targetId)) {
+    bot.sendMessage(chatId, `✅ User ${targetId} approved.`)
+    // Notify the user
+    bot.sendMessage(targetId, "✅ You've been approved! You can now use the bot.\nUse /setup to connect your Claude API key.").catch(() => {})
+  } else {
+    bot.sendMessage(chatId, `❌ User ${targetId} not found. They need to /start first.`)
+  }
+})
+
+// ── /blockuser — Admin: block a user ────────────────────────
+bot.onText(/\/blockuser\s+(\d+)/, (msg, match) => {
+  const chatId = msg.chat.id
+  if (!isAdmin(msg.from.id)) {
+    bot.sendMessage(chatId, "⛔ Admin only.")
+    return
+  }
+
+  const targetId = parseInt(match[1])
+  if (userManager.block(targetId)) {
+    bot.sendMessage(chatId, `🚫 User ${targetId} blocked.`)
+  } else {
+    bot.sendMessage(chatId, `❌ User ${targetId} not found.`)
+  }
+})
+
 // ── /sys — Direct system commands (no Claude needed) ────────
 bot.onText(/\/sys\s*(.*)/, async (msg, match) => {
   const chatId = msg.chat.id
@@ -1186,7 +1421,7 @@ bot.on("message", async (msg) => {
   }
 
   if (!isAllowed(msg.from.id)) {
-    bot.sendMessage(chatId, "⛔ Unauthorized. Check ALLOWED_TELEGRAM_IDS.")
+    bot.sendMessage(chatId, "🔑 Use /setup to connect your Claude API key and get started.")
     logger.security("Unauthorized access attempt", {
       userId: msg.from.id,
       username: msg.from.username,
@@ -1210,9 +1445,17 @@ bot.on("message", async (msg) => {
 
 // ── Core Claude query handler (with live streaming updates) ──
 async function handleClaudeQuery(chatId, prompt, msg = null) {
+  const userId = msg?.from?.id || chatId
   const projectDir = getProjectDir(chatId)
   const projectName = getProjectName(chatId)
   const startTime = Date.now()
+
+  // Get user's API key (admins can use system key)
+  const userApiKey = userManager.getApiKey(userId)
+  if (!userApiKey && !isAdmin(userId)) {
+    bot.sendMessage(chatId, "🔑 You need to connect your Claude API key first.\nUse /setup to get started.")
+    return
+  }
 
   bot.sendChatAction(chatId, "typing")
 
@@ -1253,6 +1496,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
       prompt,
       projectDir,
       projectName,
+      apiKey: userApiKey || null,
       onTyping: () => bot.sendChatAction(chatId, "typing").catch(() => {}),
       onStatusUpdate: (status) => {
         let text = ""
@@ -1316,9 +1560,13 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
     }
 
     const durationMs = Date.now() - startTime
+
+    // Record per-user usage
+    userManager.recordUsage(userId, meta)
+
     sessionTracker.record({
       chatId,
-      userId: msg?.from?.id,
+      userId,
       username: msg?.from?.username || msg?.from?.first_name,
       project: projectName,
       prompt,
@@ -1328,7 +1576,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
       meta,
     })
 
-    logger.info("BOT", `Response sent (${result?.length || 0} chars, ${(durationMs / 1000).toFixed(1)}s)`, { project: projectName })
+    logger.info("BOT", `Response sent (${result?.length || 0} chars, ${(durationMs / 1000).toFixed(1)}s)`, { project: projectName, user: userId })
   } catch (err) {
     if (statusUpdateTimer) clearTimeout(statusUpdateTimer)
 

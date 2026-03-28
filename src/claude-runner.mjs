@@ -147,12 +147,13 @@ export function runClaude({
   onStatusUpdate,
   extraFlags = [],
   newConversation = false,
+  apiKey = null,
 }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
 
-    const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT_MS) || 300000 // 5 min default
-    const skipPerms = process.env.CLAUDE_SKIP_PERMISSIONS !== "false" // default true for backward compat
+    const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT_MS) || 300000
+    const skipPerms = process.env.CLAUDE_SKIP_PERMISSIONS !== "false"
 
     const args = [
       "-p",
@@ -175,9 +176,15 @@ export function runClaude({
       resuming: isResuming,
     })
 
+    // Use per-user API key if provided, otherwise fall back to system key
+    const procEnv = { ...process.env }
+    if (apiKey) {
+      procEnv.ANTHROPIC_API_KEY = apiKey
+    }
+
     const proc = spawn("claude", args, {
       cwd: projectDir,
-      env: { ...process.env },
+      env: procEnv,
       stdio: ["ignore", "pipe", "pipe"],
     })
 
