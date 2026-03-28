@@ -153,7 +153,8 @@ export async function generateBriefing() {
   const markets = await scanner.getTopMarkets(15)
   const scan = await strategyEngine.runFullScan(100)
 
-  let msg = `📊 *Market Briefing*\n`
+  const tag = process.platform === "darwin" ? "🏠" : "☁️"
+  let msg = `${tag} *Market Briefing*\n`
   msg += `_${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}_\n\n`
 
   // Top movers
@@ -630,7 +631,8 @@ function generateScorecard() {
     `  • ${p.outcome.slice(0, 20)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
   ).join("\n")
 
-  return `💰 *Virtual Trading Scorecard*\n\n` +
+  const tag = process.platform === "darwin" ? "🏠" : "☁️"
+  return `${tag} *Virtual Trading Scorecard*\n\n` +
     `*Balance:* $${currentBalance.toFixed(2)} (started $${VIRTUAL_BANKROLL})\n` +
     `*Total P&L:* ${totalPnL >= 0 ? "+" : ""}$${totalPnL.toFixed(2)} (${roi >= 0 ? "+" : ""}${roi.toFixed(1)}%)\n` +
     `*Today:* ${(today?.day_pnl || 0) >= 0 ? "+" : ""}$${(today?.day_pnl || 0).toFixed(2)}\n\n` +

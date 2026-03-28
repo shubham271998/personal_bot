@@ -70,6 +70,8 @@ import liveMonitor from "./src/polymarket/live-monitor.mjs"
 import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 
 // ── Config ──────────────────────────────────────────────────
+const BOT_MODE = process.env.BOT_MODE || (process.platform === "darwin" ? "🏠 Local" : "☁️ Cloud")
+const BOT_TAG = BOT_MODE === "☁️ Cloud" ? "☁️" : "🏠"
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!BOT_TOKEN) {
   logger.error("BOT", "Set TELEGRAM_BOT_TOKEN env variable")
@@ -189,7 +191,7 @@ if (ownerChatId) {
   const now = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
   bot.sendMessage(
     ownerChatId,
-    `🟢 *Hey! I'm back online*\n⏰ ${now}\n📁 ${projectManager.list().length} projects loaded\n✨ Ready whenever you are`,
+    `🟢 *Hey! I'm back online* ${BOT_MODE}\n⏰ ${now}\n📁 ${projectManager.list().length} projects loaded\n✨ Ready whenever you are`,
     { parse_mode: "Markdown" },
   ).catch(() => {})
 }
@@ -482,7 +484,7 @@ bot.onText(/\/start/, (msg) => {
 
   bot.sendMessage(
     chatId,
-    `Hey ${name}! 👋\n\n` +
+    `Hey ${name}! 👋 ${BOT_MODE}\n\n` +
       `I'm your personal assistant — ask me anything, send voice notes, or control your system right from here.\n\n` +
       `${statusLine}\n` +
       (project ? `📁 Working on: *${project.name}*\n\n` : "\n") +
@@ -1763,7 +1765,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
   // Send initial status message (will be updated live)
   const statusMsg = await bot.sendMessage(
     chatId,
-    `✨ *On it!* (${projectName})\n\n` +
+    `${BOT_TAG} *On it!* (${projectName})\n\n` +
       `📝 _${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}_`,
     { parse_mode: "Markdown" },
   )
@@ -1854,7 +1856,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
     if (meta) {
       const toolCount = meta.toolLog?.length || 0
       const usageLine =
-        `📊 _${(meta.durationMs / 1000).toFixed(1)}s · $${meta.costUsd?.toFixed(4)} · ` +
+        `${BOT_TAG} _${(meta.durationMs / 1000).toFixed(1)}s · $${meta.costUsd?.toFixed(4)} · ` +
         `${meta.totalTokens.toLocaleString()} tok · ` +
         `${meta.numTurns || 0} turns · ${toolCount} tools_`
       await bot.sendMessage(chatId, usageLine, { parse_mode: "Markdown" })
