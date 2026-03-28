@@ -26,11 +26,32 @@ import negRiskScanner from "./negrisk-scanner.mjs"
 import selfImprover from "./self-improver.mjs"
 
 // ── Pro Rules (from $85M+ in proven trader research) ────────
-// Rule: NEVER trade in the $0.51-$0.67 range (where most losses cluster)
+
+// Rule 1: NEVER trade in the $0.51-$0.67 range (where most losses cluster)
 const DEAD_ZONE_MIN = 0.51
 const DEAD_ZONE_MAX = 0.67
 function isInDeadZone(price) {
   return price >= DEAD_ZONE_MIN && price <= DEAD_ZONE_MAX
+}
+
+// Rule 2: Minimum 5-cent edge to filter noise (AMM spread is ~3.5 cents)
+const MIN_EDGE = 0.05
+
+// Rule 3: Minimum $10K daily volume (confirms real interest, not thin-book artifact)
+const MIN_VOLUME_24H = 10000
+
+// Rule 4: Only act when multiple signals agree (confidence > 70%)
+const MIN_CONFIDENCE = 0.70
+
+/**
+ * Pre-trade quality filter — must pass ALL checks
+ */
+function passesQualityFilter(market, edge = 0) {
+  if (!market) return false
+  if (market.volume24hr < MIN_VOLUME_24H) return false // Too illiquid
+  if (Math.abs(edge) < MIN_EDGE && edge !== 0) return false // Edge too small
+  if (market.resolved) return false // Already resolved
+  return true
 }
 
 // ── Kelly Criterion ─────────────────────────────────────────
@@ -66,7 +87,7 @@ export async function findResolutionSnipes(minPrice = 0.93, maxPrice = 0.99) {
   const snipes = []
 
   for (const market of markets) {
-    if (!market.active) continue
+    if (!market.active || market.resolved) continue
 
     // Check if market is ending soon (within 72 hours)
     const hoursLeft = market.endDate
@@ -167,9 +188,16 @@ export async function findNewsAlpha(topN = 20) {
         }
       } catch {}
 
+      // Quality filter — skip low-volume markets
+      if (market.volume24hr < MIN_VOLUME_24H) continue
+
       // Apply Tetlock's extremization to our estimate
       const rawEstimate = sentiment.bullishPct + whaleBoost
       const extremized = selfImprover.extremize(rawEstimate, 1.3)
+      const edge = Math.abs(extremized - yesPrice)
+
+      // Minimum 5-cent edge required
+      if (edge < MIN_EDGE) continue
 
       // Strong bullish news but low market price → BUY YES
       if (extremized > 0.55 && yesPrice < 0.4) {
@@ -288,7 +316,7 @@ export async function findLongShots(maxPrice = 0.10) {
 
   for (const market of markets) {
     if (!market.active) continue
-    if (market.volume24hr < 50000) continue // Need liquidity
+    if (market.volume24hr < 100000) continue // Long shots need GOOD liquidity to exit
 
     for (const outcome of market.outcomes) {
       if (outcome.price > 0.01 && outcome.price <= maxPrice) {

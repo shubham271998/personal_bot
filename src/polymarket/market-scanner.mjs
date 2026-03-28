@@ -155,15 +155,20 @@ function parseMarket(raw) {
   const prices = JSON.parse(raw.outcomePrices || "[]")
   const tokenIds = JSON.parse(raw.clobTokenIds || "[]")
 
+  // Triple-check resolution status (some markets report active=true after resolving)
+  const isTrulyActive = raw.active && !raw.closed && raw.acceptingOrders !== false
+  const isTrulyClosed = raw.closed || raw.acceptingOrders === false || raw.umaResolutionStatus === "resolved"
+
   return {
     id: raw.id,
     question: raw.question,
     slug: raw.slug,
     description: (raw.description || "").slice(0, 300),
+    resolved: isTrulyClosed,
     volume24hr: raw.volume24hr || 0,
     volumeTotal: raw.volumeNum || 0,
     endDate: raw.endDate,
-    active: raw.active && !raw.closed,
+    active: isTrulyActive,
     outcomes: outcomes.map((name, i) => ({
       name,
       price: parseFloat(prices[i] || 0),

@@ -632,11 +632,11 @@ async function checkVirtualPositions() {
       let shouldClose = false
       let closeReason = ""
 
-      // 1. Market resolved or closed
-      if (marketClosed || (!market && pos.created_at)) {
-        // If market not found after 24h, assume resolved
+      // 1. Market resolved or closed (triple-check: closed + active + accepting_orders)
+      const isResolved = marketClosed || market?.resolved
+      if (isResolved || (!market && pos.created_at)) {
         const ageHours = (Date.now() - new Date(pos.created_at).getTime()) / 3600000
-        if (marketClosed || ageHours > 24) {
+        if (isResolved || ageHours > 24) {
           if (currentPrice >= 0.95) currentPrice = 1.0
           else if (currentPrice <= 0.05) currentPrice = 0.0
           shouldClose = true
