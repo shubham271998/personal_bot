@@ -264,8 +264,20 @@ export async function evaluateMarket(market, bankroll = 1000) {
   const checksPassesd = Object.values(result.checks).filter(Boolean).length
   const totalChecks = Object.keys(result.checks).length
 
-  // Must pass 5/7 checks AND have real edge AND 2+ confirming signals
-  result.shouldTrade = checksPassesd >= 5 && realEdge > MIN_EDGE_PCT && confirmingSignals >= MIN_SIGNALS
+  // VIRTUAL MODE: 3/7 checks + 1 confirming signal = trade (learn by doing)
+  // LIVE MODE: 5/7 checks + 2 confirming signals (strict)
+  const isVirtual = true // TODO: read from settings
+  const minChecks = isVirtual ? 3 : 5
+  const minSignals = isVirtual ? 1 : MIN_SIGNALS
+  const minEdge = isVirtual ? 0.03 : MIN_EDGE_PCT // 3% edge in virtual, 7% in live
+
+  result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
+
+  if (isVirtual && !result.shouldTrade && realEdge > 0.01) {
+    // In virtual mode, also take small-edge bets to LEARN which work
+    result.shouldTrade = true
+    result.reasoning.push("Learning trade — small edge, taking it to gather data")
+  }
   result.confidence = checksPassesd / totalChecks
   result.score = realEdge * 100 * result.confidence
 
@@ -311,7 +323,8 @@ export async function evaluateMarket(market, bankroll = 1000) {
  * Returns only markets that pass ALL checks
  */
 export async function smartScan(bankroll = 1000) {
-  const markets = await scanner.getTopMarkets(30)
+  // Scan more markets — sweet spot is $10K-$100K, not top by volume
+  const markets = await scanner.getTopMarkets(80)
   const approved = []
   let skipped = 0
 

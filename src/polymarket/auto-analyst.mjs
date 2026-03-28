@@ -519,8 +519,8 @@ const virtualStmts = {
 }
 
 const VIRTUAL_BANKROLL = 1000
-const VIRTUAL_MAX_BET = 50 // $50 max per trade
-const VIRTUAL_MAX_OPEN = 10 // Max 10 open positions
+const VIRTUAL_MAX_BET = 30 // $30 max per trade (smaller bets, more learning)
+const VIRTUAL_MAX_OPEN = 20 // Max 20 open positions (more data points)
 
 /**
  * Auto-trade based on scan results — bot decides and executes virtually
@@ -843,7 +843,7 @@ export function startAutonomous() {
   _briefingInterval = setInterval(() => sendBriefing(), 2 * 60 * 60 * 1000)
 
   // Virtual trade + evaluate every 10 minutes
-  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 10 * 60 * 1000)
+  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 5 * 60 * 1000) // Every 5 min in learning mode
   setTimeout(() => runVirtualTradingCycle(), 60000) // First run after 1 min
 
   // Evaluate predictions every 30 minutes
