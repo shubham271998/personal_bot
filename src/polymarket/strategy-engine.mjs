@@ -22,6 +22,15 @@
  */
 import scanner from "./market-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
+import negRiskScanner from "./negrisk-scanner.mjs"
+
+// ── Pro Rules (from $85M+ in proven trader research) ────────
+// Rule: NEVER trade in the $0.51-$0.67 range (where most losses cluster)
+const DEAD_ZONE_MIN = 0.51
+const DEAD_ZONE_MAX = 0.67
+function isInDeadZone(price) {
+  return price >= DEAD_ZONE_MIN && price <= DEAD_ZONE_MAX
+}
 
 // ── Kelly Criterion ─────────────────────────────────────────
 
@@ -64,6 +73,7 @@ export async function findResolutionSnipes(minPrice = 0.93, maxPrice = 0.99) {
       : Infinity
 
     for (const outcome of market.outcomes) {
+      if (isInDeadZone(outcome.price)) continue // Pro rule: avoid 51-67% zone
       if (outcome.price >= minPrice && outcome.price <= maxPrice) {
         const profit = (1 - outcome.price) * 100
         const annualizedReturn = hoursLeft > 0 && hoursLeft < 168
@@ -296,9 +306,10 @@ export async function runFullScan(bankroll = 100) {
   }
 
   // Run all strategies in parallel
-  const [snipes, arbs, newsAlpha, momentum, longShots] = await Promise.allSettled([
+  const [snipes, arbs, negRiskArbs, newsAlpha, momentum, longShots] = await Promise.allSettled([
     findResolutionSnipes(),
     findArbitrage(),
+    negRiskScanner.findNegRiskArbitrage(1.0),
     findNewsAlpha(15),
     findMomentum(),
     findLongShots(),
@@ -318,7 +329,17 @@ export async function runFullScan(bankroll = 100) {
   if (arbs.status === "fulfilled") {
     results.strategies.arbitrage = arbs.value.length
     for (const t of arbs.value.slice(0, 3)) {
-      t.betSize = Math.min(bankroll * 0.1, 50) // Arb: bet more since risk-free
+      t.betSize = Math.min(bankroll * 0.1, 50)
+      allTrades.push(t)
+    }
+  }
+
+  // NegRisk arbitrage — the #1 profit strategy ($29M extracted in one year)
+  if (negRiskArbs.status === "fulfilled") {
+    results.strategies.negRiskArbitrage = negRiskArbs.value.length
+    for (const t of negRiskArbs.value.slice(0, 5)) {
+      t.betSize = Math.min(bankroll * 0.15, 100) // Arb = risk-free, bet bigger
+      t.market = { question: t.event.title, volume24hr: t.event.volume24hr, id: t.event.eventId }
       allTrades.push(t)
     }
   }

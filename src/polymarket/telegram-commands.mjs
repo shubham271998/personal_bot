@@ -10,6 +10,7 @@ import trader from "./trader.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import marketMaker from "./market-maker.mjs"
 import executor from "./executor-bridge.mjs"
+import negRisk from "./negrisk-scanner.mjs"
 
 export function registerPolymarketCommands(bot, isAdminFn) {
   // ── /pm — Overview ────────────────────────────────────────
@@ -34,8 +35,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         `/pmportfolio — Your positions\n` +
         `/pmpnl — Profit & loss\n` +
         `/pmhistory — Trade log\n\n` +
-        `*📊 Market Making:*\n` +
-        `/pmmaker — Find spread-capture opportunities (0% fees!)\n\n` +
+        `*⚖️ Arbitrage:*\n` +
+        `/pmnegrisk — NegRisk multi-outcome arbitrage (risk-free!)\n` +
+        `/pmmaker — Market making opportunities\n\n` +
         `*💳 Wallet:*\n` +
         `/pmwallet — Check balance\n` +
         `/pmconnect <key> — Connect Polygon wallet\n\n` +
@@ -360,6 +362,42 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     const maxBet = parseInt(match[1])
     trader.updateSettings(msg.from.id, { maxBet })
     bot.sendMessage(msg.chat.id, `Max bet set to $${maxBet}`)
+  })
+
+  // ── /pmnegrisk — NegRisk arbitrage scan ─────────────────────
+  bot.onText(/\/pmnegrisk/, async (msg) => {
+    const chatId = msg.chat.id
+    const loading = await bot.sendMessage(chatId, "⚖️ _Scanning NegRisk events for arbitrage..._\n_This is the strategy that extracted $29M in one year_", { parse_mode: "Markdown" })
+
+    try {
+      const opps = await negRisk.findNegRiskArbitrage(0.5)
+
+      if (opps.length === 0) {
+        bot.editMessageText("No NegRisk arbitrage right now. Markets are efficiently priced — I'll keep watching!", {
+          chat_id: chatId, message_id: loading.message_id,
+        })
+        return
+      }
+
+      const lines = opps.slice(0, 5).map((opp, i) => {
+        const outcomeList = opp.event.outcomes.slice(0, 5).map((o) =>
+          `   ${o.name}: ${(o.yesPrice * 100).toFixed(1)}%`,
+        ).join("\n")
+        return `${i + 1}. ⚖️ *${opp.event.title.slice(0, 55)}*\n` +
+          `   YES prices sum: *${(opp.event.totalYesPrice * 100).toFixed(1)}%* (should be 100%)\n` +
+          `   Spread: *${opp.spreadPct}%* → ${opp.direction}\n` +
+          `   Profit: *${opp.tradeDetails.profitPct}%* guaranteed\n` +
+          `${outcomeList}`
+      })
+
+      bot.editMessageText(
+        `⚖️ *NegRisk Arbitrage Opportunities*\n` +
+          `_Multi-outcome events where prices don't add up_\n\n${lines.join("\n\n")}`,
+        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.editMessageText(`Scan failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+    }
   })
 
   // ── /pmwallet — Connect wallet & check balance ────────────

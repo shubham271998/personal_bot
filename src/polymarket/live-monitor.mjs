@@ -23,6 +23,7 @@ import marketMaker from "./market-maker.mjs"
 import scanner from "./market-scanner.mjs"
 import trader from "./trader.mjs"
 import stream from "./realtime-stream.mjs"
+import negRisk from "./negrisk-scanner.mjs"
 
 // ── Config ──────────────────────────────────────────────────
 const SCAN_INTERVAL_MS = 5 * 60 * 1000  // Full scan every 5 min
@@ -190,6 +191,21 @@ async function runFullScan(bankroll) {
         }
       }
     }
+    // Check NegRisk arbitrage separately (highest priority — risk-free)
+    try {
+      const negRiskAlerts = await negRisk.checkNegRiskChanges()
+      for (const alert of negRiskAlerts) {
+        await sendAlert(
+          `⚖️ *NEW NEGRISK ARBITRAGE!*\n\n` +
+            `*${alert.event.title}*\n` +
+            `YES prices sum: ${(alert.event.totalYesPrice * 100).toFixed(1)}%\n` +
+            `Spread: ${alert.previousSpread}% → *${alert.currentSpread}%*\n` +
+            `Direction: ${alert.event.direction}\n\n` +
+            `_This is RISK-FREE profit. Use /pmnegrisk for details._`,
+        )
+      }
+    } catch {}
+
   } catch (err) {
     console.error("[PM-MONITOR] Scan error:", err.message)
   }
