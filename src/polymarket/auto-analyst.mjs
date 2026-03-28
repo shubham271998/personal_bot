@@ -14,6 +14,22 @@ import newsAnalyzer from "./news-analyzer.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import db from "../database.mjs"
 
+// ── Safe Telegram sender (handles markdown errors) ──────────
+function escapeMarkdown(text) {
+  if (!text) return ""
+  return text.replace(/([*_`\[\]])/g, "\\$1")
+}
+
+async function safeSend(bot, chatId, text, opts = {}) {
+  try {
+    return await bot.sendMessage(chatId, text, { parse_mode: "Markdown", ...opts })
+  } catch {
+    // Markdown failed — send as plain text (strip markdown)
+    const plain = text.replace(/\*|_|`/g, "").replace(/\\/g, "")
+    return await bot.sendMessage(chatId, plain).catch(() => {})
+  }
+}
+
 // ── DB Tables for self-evaluation ───────────────────────────
 db.raw.exec(`
   CREATE TABLE IF NOT EXISTS pm_predictions (
@@ -149,7 +165,7 @@ export async function generateBriefing() {
       value: o.price * 100,
       display: `${(o.price * 100).toFixed(0)}%`,
     }))
-    msg += `\n*${m.question.slice(0, 55)}*\n`
+    msg += `\n*${escapeMarkdown(m.question.slice(0, 55))}*\n`
     msg += `\`\`\`\n${makeBarChart(chartItems)}\n\`\`\`\n`
     msg += `Vol: $${(m.volume24hr / 1000).toFixed(0)}K\n`
   }
@@ -160,7 +176,7 @@ export async function generateBriefing() {
     for (const pick of scan.topPicks.slice(0, 3)) {
       const emoji = pick.risk === "NONE" ? "⚖️" : pick.risk === "LOW" ? "🛡️" : pick.risk === "MEDIUM" ? "⚡" : "🎰"
       msg += `\n${emoji} *${pick.strategy}*\n`
-      msg += `${pick.market?.question?.slice(0, 50) || "Unknown"}\n`
+      msg += `${escapeMarkdown(pick.market?.question?.slice(0, 50) || "Unknown")}\n`
       msg += `${pick.reasoning?.slice(0, 80) || ""}\n`
       msg += `💵 Suggested: $${(pick.betSize || 0).toFixed(2)}\n`
     }
@@ -683,7 +699,7 @@ async function sendBriefing() {
   if (!_bot || !_chatId) return
   try {
     const briefing = await generateBriefing()
-    await _bot.sendMessage(_chatId, briefing, { parse_mode: "Markdown" })
+    await safeSend(_bot, _chatId, briefing)
 
     // Record predictions from the scan
     const scan = await strategyEngine.runFullScan(100)
@@ -723,7 +739,7 @@ async function runEvaluation() {
       // Save periodic score
       saveEvalScore()
 
-      await _bot.sendMessage(_chatId, msg, { parse_mode: "Markdown" })
+      await safeSend(_bot, _chatId, msg)
     }
   } catch (err) {
     console.error("[AUTO-ANALYST] Eval error:", err.message)
@@ -735,13 +751,11 @@ async function runWatchlistUpdate() {
   try {
     const result = await autoManageWatchlist()
     if (result.added.length > 0) {
-      await _bot.sendMessage(
-        _chatId,
-        `👀 *Watchlist Updated*\n\n` +
+      await safeSend(_bot, _chatId,
+        `👀 Watchlist Updated\n\n` +
           `Added ${result.added.length} markets:\n` +
-          result.added.map((a) => `• ${a}`).join("\n") +
+          result.added.map((a) => `• ${escapeMarkdown(a)}`).join("\n") +
           `\n\n📊 Total watching: ${result.total}`,
-        { parse_mode: "Markdown" },
       )
     }
   } catch (err) {
@@ -759,10 +773,8 @@ async function runVirtualTradingCycle() {
         const icon = c.pnl >= 0 ? "✅" : "❌"
         return `${icon} ${c.outcome.slice(0, 30)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}`
       })
-      await _bot.sendMessage(
-        _chatId,
+      await safeSend(_bot, _chatId,
         `💰 *Positions Closed*\n\n${lines.join("\n")}\n\n_Virtual trading — tracking performance_`,
-        { parse_mode: "Markdown" },
       )
     }
 
@@ -776,10 +788,8 @@ async function runVirtualTradingCycle() {
       const lines = recent.map((p) =>
         `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
       )
-      await _bot.sendMessage(
-        _chatId,
+      await safeSend(_bot, _chatId,
         `📝 *Auto-Traded ${tradesPlaced} positions*\n\n${lines.join("\n")}\n\n_Virtual $${VIRTUAL_BANKROLL} bankroll_`,
-        { parse_mode: "Markdown" },
       )
     }
 
@@ -804,7 +814,7 @@ async function sendScorecard() {
   if (!_bot || !_chatId) return
   try {
     const scorecard = generateScorecard()
-    await _bot.sendMessage(_chatId, scorecard, { parse_mode: "Markdown" })
+    await safeSend(_bot, _chatId, scorecard)
   } catch (err) {
     console.error("[AUTO-ANALYST] Scorecard error:", err.message)
   }

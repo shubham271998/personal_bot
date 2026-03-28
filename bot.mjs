@@ -1951,10 +1951,20 @@ process.on("SIGINT", () => {
   process.exit(0)
 })
 
+// Suppress Telegram markdown parse errors (non-fatal)
+bot.on("polling_error", (err) => {
+  if (!err.message?.includes("EFATAL")) {
+    logger.error("BOT", `Polling error: ${err.message}`)
+  }
+})
+
 process.on("uncaughtException", (err) => {
-  logger.error("BOT", `Uncaught exception: ${err.message}`, { stack: err.stack })
+  logger.error("BOT", `Uncaught exception: ${err.message}`)
 })
 
 process.on("unhandledRejection", (reason) => {
-  logger.error("BOT", `Unhandled rejection: ${reason}`)
+  const msg = String(reason)
+  // Don't log Telegram parse errors — they're handled
+  if (msg.includes("can't parse entities")) return
+  logger.error("BOT", `Unhandled rejection: ${msg}`)
 })

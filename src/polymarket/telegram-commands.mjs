@@ -12,6 +12,15 @@ import marketMaker from "./market-maker.mjs"
 import executor from "./executor-bridge.mjs"
 import negRisk from "./negrisk-scanner.mjs"
 
+// Safe Telegram message helpers — fall back to plain text if markdown breaks
+async function safeEdit(bot, chatId, msgId, text) {
+  try {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: "Markdown" })
+  } catch {
+    await bot.editMessageText(text.replace(/[*_`\[\]\\]/g, ""), { chat_id: chatId, message_id: msgId }).catch(() => {})
+  }
+}
+
 export function registerPolymarketCommands(bot, isAdminFn) {
   // ── /pm — Overview ────────────────────────────────────────
   bot.onText(/\/pm$/, (msg) => {
@@ -65,14 +74,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         return `${i + 1}. *${m.question.slice(0, 70)}*\n${outcomes}\n  📊 ${vol} vol/24h`
       })
 
-      bot.editMessageText(
-        `🔥 *Trending on Polymarket*\n\n${lines.join("\n\n")}`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `🔥 *Trending on Polymarket*\n\n${lines.join("\n\n")}`)
     } catch (err) {
-      bot.editMessageText(`Couldn't fetch markets: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Couldn't fetch markets: ${err.message}`)
     }
   })
 
@@ -112,9 +116,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const opps = await scanner.findOpportunities(50)
 
       if (opps.length === 0) {
-        bot.editMessageText("No obvious opportunities right now. Markets look efficiently priced! ⚖️", {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, "No obvious opportunities right now. Markets look efficiently priced! ⚖️")
         return
       }
 
@@ -127,14 +129,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         return `${i + 1}. *${m.question.slice(0, 70)}*\n  ${outcomes}\n  🎯 Score: ${opp.signals.score.toFixed(1)}\n  ${reasons}`
       })
 
-      bot.editMessageText(
-        `🔮 *Opportunities Found*\n\n${lines.join("\n\n")}\n\n_Higher score = stronger signal_`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `🔮 *Opportunities Found*\n\n${lines.join("\n\n")}\n\n_Higher score = stronger signal_`)
     } catch (err) {
-      bot.editMessageText(`Scan failed: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Scan failed: ${err.message}`)
     }
   })
 
@@ -153,17 +150,12 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         `• ${h.title.slice(0, 80)}${h.source ? ` _(${h.source})_` : ""}`,
       ).join("\n")
 
-      bot.editMessageText(
-        `📰 *News Analysis: ${topic}*\n\n` +
+      safeEdit(bot, chatId, loading.message_id, `📰 *News Analysis: ${topic}*\n\n` +
           `${emoji} Sentiment: *${sentiment.sentiment.toUpperCase()}*\n` +
           `  🟢 Bullish: ${sentiment.bullish} | 🔴 Bearish: ${sentiment.bearish} | ⚪ Neutral: ${sentiment.neutral}\n\n` +
-          `*Headlines:*\n${headlineList || "No recent headlines found"}`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+          `*Headlines:*\n${headlineList || "No recent headlines found"}`)
     } catch (err) {
-      bot.editMessageText(`News fetch failed: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `News fetch failed: ${err.message}`)
     }
   })
 
@@ -177,9 +169,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       // Find the market
       const markets = await scanner.searchMarkets(query, 1)
       if (markets.length === 0) {
-        bot.editMessageText(`Couldn't find a market matching "${query}"`, {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, `Couldn't find a market matching "${query}"`)
         return
       }
 
@@ -206,19 +196,14 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         `• ${h.title.slice(0, 70)}`,
       ).join("\n")
 
-      bot.editMessageText(
-        `🧠 *Analysis: ${market.question.slice(0, 60)}*\n\n` +
+      safeEdit(bot, chatId, loading.message_id, `🧠 *Analysis: ${market.question.slice(0, 60)}*\n\n` +
           `*Current Odds:*\n${outcomes}\n\n` +
           `*News Sentiment:* ${sentEmoji} ${sentiment.sentiment}\n` +
           `${headlineList ? headlineList + "\n\n" : "\n"}` +
           `${edgeText}\n\n` +
-          `_Vol: $${(market.volume24hr / 1000).toFixed(0)}K/24h_`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+          `_Vol: $${(market.volume24hr / 1000).toFixed(0)}K/24h_`)
     } catch (err) {
-      bot.editMessageText(`Analysis failed: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Analysis failed: ${err.message}`)
     }
   })
 
@@ -373,9 +358,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const opps = await negRisk.findNegRiskArbitrage(0.5)
 
       if (opps.length === 0) {
-        bot.editMessageText("No NegRisk arbitrage right now. Markets are efficiently priced — I'll keep watching!", {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, "No NegRisk arbitrage right now. Markets are efficiently priced — I'll keep watching!")
         return
       }
 
@@ -390,13 +373,10 @@ export function registerPolymarketCommands(bot, isAdminFn) {
           `${outcomeList}`
       })
 
-      bot.editMessageText(
-        `⚖️ *NegRisk Arbitrage Opportunities*\n` +
-          `_Multi-outcome events where prices don't add up_\n\n${lines.join("\n\n")}`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `⚖️ *NegRisk Arbitrage Opportunities*\n` +
+          `_Multi-outcome events where prices don't add up_\n\n${lines.join("\n\n")}`)
     } catch (err) {
-      bot.editMessageText(`Scan failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+      safeEdit(bot, chatId, loading.message_id, `Scan failed: ${err.message}`)
     }
   })
 
@@ -431,20 +411,15 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const balance = await executor.getBalance(pk)
       const settings = trader.getSettings(msg.from.id)
 
-      bot.editMessageText(
-        `💳 *Your Wallet*\n\n` +
+      safeEdit(bot, chatId, loading.message_id, `💳 *Your Wallet*\n\n` +
           `Address: \`${balance.address}\`\n` +
           `USDC: *$${balance.usdc.toFixed(2)}*\n` +
           `MATIC: ${balance.matic.toFixed(4)} (for gas)\n\n` +
           `Mode: ${settings.paper_mode ? "📝 Paper" : "💰 Live"}\n\n` +
           `_/pmapprove to approve USDC for trading (one-time)_\n` +
-          `_/pmset paper off to switch to live mode_`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+          `_/pmset paper off to switch to live mode_`)
     } catch (err) {
-      bot.editMessageText(`Wallet check failed: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Wallet check failed: ${err.message}`)
     }
   })
 
@@ -471,8 +446,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       executor.storeWalletKey(msg.from.id, key)
       trader.updateSettings(msg.from.id, { privateKey: "stored_in_executor" })
 
-      bot.editMessageText(
-        `✅ *Wallet Connected!*\n\n` +
+      safeEdit(bot, chatId, loading.message_id, `✅ *Wallet Connected!*\n\n` +
           `Address: \`${balance.address}\`\n` +
           `USDC: $${balance.usdc.toFixed(2)}\n` +
           `MATIC: ${balance.matic.toFixed(4)}\n\n` +
@@ -480,13 +454,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
           `1. /pmapprove — Approve USDC for trading (one-time, costs ~0.01 MATIC)\n` +
           `2. /pmset paper off — Switch to live mode\n` +
           `3. Start trading!\n\n` +
-          `_Key deleted from chat & encrypted in database._`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+          `_Key deleted from chat & encrypted in database._`)
     } catch (err) {
-      bot.editMessageText(`Couldn't connect: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Couldn't connect: ${err.message}`)
     }
   })
 
@@ -510,19 +480,14 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     try {
       const result = await executor.approveTrading(pk)
 
-      bot.editMessageText(
-        `✅ *USDC Approved for Trading!*\n\n` +
+      safeEdit(bot, chatId, loading.message_id, `✅ *USDC Approved for Trading!*\n\n` +
           `Approved ${result.exchanges} exchange contracts:\n` +
           `• CTF Exchange (binary markets)\n` +
           `• NegRisk Exchange (multi-outcome)\n` +
           `• NegRisk Adapter\n\n` +
-          `You're ready to trade! Use /pmset paper off to go live.`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+          `You're ready to trade! Use /pmset paper off to go live.`)
     } catch (err) {
-      bot.editMessageText(`Approval failed: ${err.message}\n\nMake sure you have MATIC for gas fees.`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Approval failed: ${err.message}\n\nMake sure you have MATIC for gas fees.`)
     }
   })
 
@@ -579,9 +544,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const opps = await marketMaker.findMMOpportunities(markets)
 
       if (opps.length === 0) {
-        bot.editMessageText("No good market making opportunities right now.", {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, "No good market making opportunities right now.")
         return
       }
 
@@ -594,13 +557,10 @@ export function registerPolymarketCommands(bot, isAdminFn) {
           `   Sim: Buy@${sim.buyPrice} Sell@${sim.sellPrice} → $${sim.totalProfit}/round`
       })
 
-      bot.editMessageText(
-        `📊 *Market Making Opportunities*\n` +
-          `_Makers pay 0% fees + earn rebates!_\n\n${lines.join("\n\n")}`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `📊 *Market Making Opportunities*\n` +
+          `_Makers pay 0% fees + earn rebates!_\n\n${lines.join("\n\n")}`)
     } catch (err) {
-      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+      safeEdit(bot, chatId, loading.message_id, `Failed: ${err.message}`)
     }
   })
 
@@ -659,13 +619,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
         report += `_Use /pmbuy <market_id> <outcome> <$amount> to trade_`
       }
 
-      bot.editMessageText(report, {
-        chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown",
-      })
+      safeEdit(bot, chatId, loading.message_id, report)
     } catch (err) {
-      bot.editMessageText(`Scan failed: ${err.message}`, {
-        chat_id: chatId, message_id: loading.message_id,
-      })
+      safeEdit(bot, chatId, loading.message_id, `Scan failed: ${err.message}`)
     }
   })
 
@@ -678,9 +634,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const snipes = await strategyEngine.findResolutionSnipes(0.90, 0.99)
 
       if (snipes.length === 0) {
-        bot.editMessageText("No good snipes right now. Check back later!", {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, "No good snipes right now. Check back later!")
         return
       }
 
@@ -691,12 +645,9 @@ export function registerPolymarketCommands(bot, isAdminFn) {
           `   ID: \`${s.market.id}\``
       })
 
-      bot.editMessageText(
-        `🛡️ *Resolution Snipes*\n_Buy near-certain outcomes for small guaranteed profit_\n\n${lines.join("\n\n")}`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `🛡️ *Resolution Snipes*\n_Buy near-certain outcomes for small guaranteed profit_\n\n${lines.join("\n\n")}`)
     } catch (err) {
-      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+      safeEdit(bot, chatId, loading.message_id, `Failed: ${err.message}`)
     }
   })
 
@@ -709,9 +660,7 @@ export function registerPolymarketCommands(bot, isAdminFn) {
       const shots = await strategyEngine.findLongShots(0.15)
 
       if (shots.length === 0) {
-        bot.editMessageText("No interesting long shots right now.", {
-          chat_id: chatId, message_id: loading.message_id,
-        })
+        safeEdit(bot, chatId, loading.message_id, "No interesting long shots right now.")
         return
       }
 
@@ -721,13 +670,10 @@ export function registerPolymarketCommands(bot, isAdminFn) {
           `   ID: \`${s.market.id}\``,
       )
 
-      bot.editMessageText(
-        `🎰 *Long Shots*\n_Small bets, massive payoffs if they hit_\n\n${lines.join("\n\n")}\n\n` +
-          `_Only bet what you can afford to lose!_`,
-        { chat_id: chatId, message_id: loading.message_id, parse_mode: "Markdown" },
-      )
+      safeEdit(bot, chatId, loading.message_id, `🎰 *Long Shots*\n_Small bets, massive payoffs if they hit_\n\n${lines.join("\n\n")}\n\n` +
+          `_Only bet what you can afford to lose!_`)
     } catch (err) {
-      bot.editMessageText(`Failed: ${err.message}`, { chat_id: chatId, message_id: loading.message_id })
+      safeEdit(bot, chatId, loading.message_id, `Failed: ${err.message}`)
     }
   })
 }
