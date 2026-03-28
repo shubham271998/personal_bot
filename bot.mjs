@@ -93,44 +93,44 @@ if (projectManager.list().length === 0) {
 
 // Register all commands so they show in Telegram's / menu
 bot.setMyCommands([
-  { command: "start", description: "Show help and all commands" },
-  { command: "ask", description: "Ask Claude about the project" },
-  { command: "cancel", description: "Stop a running Claude request" },
-  { command: "status", description: "Check if Claude is processing" },
+  { command: "start", description: "Hey! See what I can do" },
+  { command: "ask", description: "Ask me anything" },
+  { command: "cancel", description: "Stop current task" },
+  { command: "status", description: "Am I working on something?" },
   { command: "projects", description: "List all projects" },
-  { command: "scanprojects", description: "Scan system for git repos" },
-  { command: "addallprojects", description: "Auto-add all discovered repos" },
-  { command: "addproject", description: "Add a project: /addproject name path" },
-  { command: "removeproject", description: "Remove a project: /removeproject name" },
-  { command: "switch", description: "Switch active project: /switch name" },
-  { command: "review", description: "Review code changes (branch/last)" },
-  { command: "gitstatus", description: "Git status & recent commits" },
-  { command: "diff", description: "Show current git diff" },
-  { command: "commitmsg", description: "Generate commit message from diff" },
-  { command: "explain", description: "Explain a file or function" },
-  { command: "check", description: "Quick bug check on changes or file" },
-  { command: "newchat", description: "Start fresh Claude conversation" },
-  { command: "sessions", description: "Session stats overview" },
-  { command: "history", description: "Recent session history" },
-  { command: "sessioninfo", description: "Detailed session info: /sessioninfo <id>" },
-  { command: "context", description: "Context usage analysis" },
-  { command: "running", description: "Currently running sessions" },
-  { command: "clearsessions", description: "Clear session history" },
-  { command: "logs", description: "View recent logs" },
+  { command: "scanprojects", description: "Find projects on your machine" },
+  { command: "addallprojects", description: "Add all found projects" },
+  { command: "addproject", description: "Add a project manually" },
+  { command: "removeproject", description: "Remove a project" },
+  { command: "switch", description: "Switch to a different project" },
+  { command: "review", description: "Review your code changes" },
+  { command: "gitstatus", description: "Quick git overview" },
+  { command: "diff", description: "Show what changed" },
+  { command: "commitmsg", description: "Write a commit message for you" },
+  { command: "explain", description: "Explain some code" },
+  { command: "check", description: "Quick bug check" },
+  { command: "newchat", description: "Fresh start, clean slate" },
+  { command: "sessions", description: "Your session stats" },
+  { command: "history", description: "Recent conversations" },
+  { command: "sessioninfo", description: "Deep dive into a session" },
+  { command: "context", description: "How much context am I using?" },
+  { command: "running", description: "What's running right now?" },
+  { command: "clearsessions", description: "Clear history" },
+  { command: "logs", description: "Recent logs" },
   { command: "guard", description: "Security guard status" },
-  { command: "guardstart", description: "Start webcam monitoring" },
-  { command: "guardstop", description: "Stop webcam monitoring" },
-  { command: "guardsnap", description: "Take test webcam photo" },
-  { command: "guardscreen", description: "Take test screenshot" },
-  { command: "guardsetface", description: "Set reference face photo" },
-  { command: "sys", description: "System command: /sys sleep|shutdown|volume|battery|..." },
-  { command: "permit", description: "Check & grant macOS permissions" },
-  { command: "setup", description: "Connect your Claude API key" },
-  { command: "myusage", description: "View your usage & spending" },
-  { command: "removekey", description: "Remove your API key" },
-  { command: "users", description: "(Admin) List all users" },
-  { command: "approve", description: "(Admin) Approve user: /approve <id>" },
-  { command: "blockuser", description: "(Admin) Block user: /blockuser <id>" },
+  { command: "guardstart", description: "Start watching your laptop" },
+  { command: "guardstop", description: "Stop watching" },
+  { command: "guardsnap", description: "Quick webcam check" },
+  { command: "guardscreen", description: "Take a screenshot" },
+  { command: "guardsetface", description: "Set your face for recognition" },
+  { command: "sys", description: "Control your system" },
+  { command: "permit", description: "Check permissions" },
+  { command: "setup", description: "Connect your account" },
+  { command: "myusage", description: "Your usage & spending" },
+  { command: "removekey", description: "Disconnect your account" },
+  { command: "users", description: "See all users (admin)" },
+  { command: "approve", description: "Approve someone (admin)" },
+  { command: "blockuser", description: "Block someone (admin)" },
 ])
 
 // Track the owner's chat ID — auto-detected from first message or from env
@@ -163,7 +163,7 @@ if (ownerChatId) {
   const now = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
   bot.sendMessage(
     ownerChatId,
-    `🟢 *Laptop Active — Bot Online*\n⏰ ${now}\n📁 Projects: ${projectManager.list().length}\n🤖 Ready for commands`,
+    `🟢 *Hey! I'm back online*\n⏰ ${now}\n📁 ${projectManager.list().length} projects loaded\n✨ Ready whenever you are`,
     { parse_mode: "Markdown" },
   ).catch(() => {})
 }
@@ -251,60 +251,26 @@ bot.onText(/\/start/, (msg) => {
     })
   }
 
+  const name = msg.from.first_name || msg.from.username || "there"
   const hasKey = userManager.hasApiKey(userId)
-  const setupHint = hasKey
-    ? `✅ Claude connected`
-    : `⚠️ Not connected — use /setup to link your Claude API key`
+  const statusLine = hasKey
+    ? `✅ You're all set up!`
+    : `👋 Use /setup to connect your account and get started`
 
   bot.sendMessage(
     chatId,
-    `🤖 *Claude Code Bot v2.0*\n\n` +
-      `Your ID: \`${userId}\`\n` +
-      `${setupHint}\n` +
-      `Active project: \`${project?.name || "none"}\`\n\n` +
-      `*Getting Started:*\n` +
-      `/setup — Connect your Claude API key\n` +
-      `/myusage — View your usage & costs\n` +
-      `/removekey — Disconnect your key\n\n` +
-      `*General Commands:*\n` +
-      `/ask <prompt> — Ask Claude about the project\n` +
-      `/newchat — Start fresh conversation\n` +
-      `/cancel — Stop running request\n` +
-      `/status — Check if Claude is processing\n\n` +
-      `*Project Management:*\n` +
-      `/projects — List all projects\n` +
-      `/scanprojects — Scan system for git repos\n` +
-      `/addallprojects — Auto-add all found repos\n` +
-      `/addproject <name> <path> — Add manually\n` +
-      `/removeproject <name> — Remove a project\n` +
-      `/switch <name> — Switch active project\n\n` +
-      `*Code Review:*\n` +
-      `/review — Review uncommitted changes\n` +
-      `/review branch — Review current branch vs main\n` +
-      `/review last — Review last commit\n` +
-      `/gitstatus — Git status & recent commits\n` +
-      `/diff — Show current diff\n` +
-      `/commitmsg — Generate commit message\n` +
-      `/explain <file or function> — Explain code\n` +
-      `/check [file] — Quick bug check\n\n` +
-      `*System Control:*\n` +
-      `/sys — Direct system commands (sleep, shutdown, volume, etc.)\n` +
-      `Or just tell Claude: "put my laptop to sleep"\n\n` +
-      `*Security:*\n` +
-      `/guard — Security guard status\n` +
-      `/guardstart — Start webcam monitoring\n` +
-      `/guardstop — Stop webcam monitoring\n` +
-      `/guardsnap — Take test webcam photo\n\n` +
-      `*Sessions & Context:*\n` +
-      `/sessions — Session stats overview\n` +
-      `/history [n] — Recent session history\n` +
-      `/sessioninfo <id> — Detailed session info\n` +
-      `/context — Context usage analysis\n` +
-      `/running — Currently running sessions\n` +
-      `/clearsessions — Clear session history\n\n` +
-      `*Logs:*\n` +
-      `/logs [category] — View recent logs\n\n` +
-      `Or just send any message to chat with Claude!`,
+    `Hey ${name}! 👋\n\n` +
+      `I'm your personal assistant — ask me anything, send voice notes, or control your system right from here.\n\n` +
+      `${statusLine}\n` +
+      (project ? `📁 Working on: *${project.name}*\n\n` : "\n") +
+      `*Here's what I can do:*\n\n` +
+      `💬 *Chat* — Just type or send a voice message\n` +
+      `💻 *Code* — /review, /diff, /explain, /check\n` +
+      `🎵 *Music* — "Play Arijit Singh on Spotify"\n` +
+      `🖥️ *System* — /sys sleep, volume, battery...\n` +
+      `🛡️ *Security* — /guardstart to watch your laptop\n` +
+      `📊 *Stats* — /myusage to track your spending\n\n` +
+      `_Just talk to me like you would to a friend!_ ✨`,
     { parse_mode: "Markdown" },
   )
 })
@@ -312,10 +278,11 @@ bot.onText(/\/start/, (msg) => {
 // ── /cancel ─────────────────────────────────────────────────
 bot.onText(/\/cancel/, (msg) => {
   const chatId = msg.chat.id
+  const name = msg.from.first_name || "there"
   if (cancelSession(chatId)) {
-    bot.sendMessage(chatId, "🛑 Cancelled.")
+    bot.sendMessage(chatId, `Done ${name}, I've stopped what I was doing.`)
   } else {
-    bot.sendMessage(chatId, "Nothing running.")
+    bot.sendMessage(chatId, `I'm not working on anything right now, ${name}.`)
   }
 })
 
@@ -327,13 +294,14 @@ bot.onText(/\/status/, (msg) => {
     const elapsed = Math.round((Date.now() - session.startedAt) / 1000)
     bot.sendMessage(
       chatId,
-      `⏳ Claude is thinking...\n` +
-        `Project: ${session.projectName}\n` +
-        `Running for: ${elapsed}s\n` +
-        `Prompt: ${session.prompt}`,
+      `Yeah, I'm working on something!\n` +
+        `📁 ${session.projectName}\n` +
+        `⏱ ${elapsed}s so far\n` +
+        `📝 _${session.prompt}_`,
+      { parse_mode: "Markdown" },
     )
   } else {
-    bot.sendMessage(chatId, `💤 Idle.\nActive project: ${getProjectName(chatId)}`)
+    bot.sendMessage(chatId, `I'm free right now! What do you need? 😊\n📁 Project: ${getProjectName(chatId)}`)
   }
 })
 
@@ -459,7 +427,7 @@ bot.onText(/\/switch\s+(\S+)/, (msg, match) => {
 bot.onText(/\/newchat/, (msg) => {
   const chatId = msg.chat.id
   resetConversation(chatId)
-  bot.sendMessage(chatId, "🔄 Fresh conversation started. Claude won't remember previous messages.")
+  bot.sendMessage(chatId, "Fresh start! 🧹 I won't remember our previous chat. What's up?")
 })
 
 // ── /review ─────────────────────────────────────────────────
@@ -467,7 +435,7 @@ bot.onText(/\/review\s*(.*)/, async (msg, match) => {
   const chatId = msg.chat.id
   if (!isAllowed(msg.from.id)) return
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Already processing. /cancel to stop.")
+    bot.sendMessage(chatId, "Hold on, I'm still working on something. Use /cancel if you want me to stop.")
     return
   }
 
@@ -535,7 +503,7 @@ bot.onText(/\/commitmsg/, async (msg) => {
   const chatId = msg.chat.id
   if (!isAllowed(msg.from.id)) return
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Already processing.")
+    bot.sendMessage(chatId, "I'm on it already! Give me a sec.")
     return
   }
 
@@ -560,7 +528,7 @@ bot.onText(/\/explain\s+(.+)/, async (msg, match) => {
   const chatId = msg.chat.id
   if (!isAllowed(msg.from.id)) return
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Already processing.")
+    bot.sendMessage(chatId, "I'm on it already! Give me a sec.")
     return
   }
 
@@ -587,7 +555,7 @@ bot.onText(/\/check\s*(.*)/, async (msg, match) => {
   const chatId = msg.chat.id
   if (!isAllowed(msg.from.id)) return
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Already processing.")
+    bot.sendMessage(chatId, "I'm on it already! Give me a sec.")
     return
   }
 
@@ -1046,7 +1014,8 @@ bot.onText(/\/setup/, (msg) => {
     return
   }
 
-  bot.sendMessage(chatId, `🔑 *Connect Your Claude Account*\n\nChoose how to connect:`, {
+  const setupName = msg.from.first_name || "there"
+  bot.sendMessage(chatId, `Hey ${setupName}! Let's get you set up 🚀\n\nHow would you like to connect?`, {
     parse_mode: "Markdown",
     reply_markup: {
       inline_keyboard: [
@@ -1069,11 +1038,12 @@ bot.on("callback_query", async (query) => {
     awaitingInput.set(chatId, "api_key")
     await bot.sendMessage(
       chatId,
-      `🔑 *Paste your Anthropic API Key*\n\n` +
-        `1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)\n` +
-        `2. Click "Create Key"\n` +
-        `3. Copy and paste it here\n\n` +
-        `_Your key will be deleted from chat & encrypted immediately._`,
+      `Great choice! 🔑\n\n` +
+        `Here's what to do:\n` +
+        `1. Head to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)\n` +
+        `2. Hit "Create Key"\n` +
+        `3. Paste it right here\n\n` +
+        `_Don't worry — I'll delete the message instantly and encrypt your key. Nobody can see it, not even the admin._`,
       { parse_mode: "Markdown", disable_web_page_preview: true },
     )
   }
@@ -1082,10 +1052,9 @@ bot.on("callback_query", async (query) => {
     awaitingInput.set(chatId, "claude_email")
     await bot.sendMessage(
       chatId,
-      `📧 *Claude Email Login*\n\n` +
-        `Send me the email you use for your Anthropic/Claude account.\n\n` +
-        `I'll guide you through getting your API key.\n` +
-        `_Your email is only used to verify your account — it's not stored._`,
+      `Sure! 📧\n\n` +
+        `What email do you use for your Anthropic/Claude account?\n\n` +
+        `_I'll walk you through the process — your email isn't stored._`,
       { parse_mode: "Markdown" },
     )
   }
@@ -1124,7 +1093,7 @@ bot.on("message", async (msg) => {
     }
 
     // Validate key actually works by making a test call
-    const validMsg = await bot.sendMessage(chatId, "🔄 _Validating your API key..._", { parse_mode: "Markdown" })
+    const validMsg = await bot.sendMessage(chatId, "🔄 _Checking your key... one moment_", { parse_mode: "Markdown" })
 
     try {
       const { default: Anthropic } = await import("@anthropic-ai/sdk")
@@ -1144,22 +1113,22 @@ bot.on("message", async (msg) => {
       userManager.approve(userId)
 
       bot.editMessageText(
-        `✅ *Connected!* Your API key is valid and encrypted.\n\n` +
-          `You can now send messages to Claude.\n` +
-          `• /myusage — Your usage & costs\n` +
-          `• /removekey — Disconnect\n` +
-          `• /newchat — Fresh conversation`,
+        `You're all set! 🎉\n\n` +
+          `Everything's connected and ready to go.\n` +
+          `Just send me a message and I'll help you out!\n\n` +
+          `• /myusage — See your stats\n` +
+          `• /removekey — Disconnect anytime`,
         { chat_id: chatId, message_id: validMsg.message_id, parse_mode: "Markdown" },
       )
       logger.info("USER", `New user: ${msg.from.username || userId} (${mode})`)
     } catch (err) {
       bot.editMessageText(
-        `❌ *Key validation failed*\n\n` +
-          `The key didn't work. Check that:\n` +
-          `• It's copied correctly (starts with \`sk-ant-\`)\n` +
-          `• It has API access enabled\n` +
-          `• Your Anthropic account has credits\n\n` +
-          `Try /setup again.`,
+        `Hmm, that key didn't work 😕\n\n` +
+          `Quick checklist:\n` +
+          `• Copied the full key? (starts with \`sk-ant-\`)\n` +
+          `• API access enabled on your account?\n` +
+          `• Got some credits loaded?\n\n` +
+          `Give /setup another shot when ready!`,
         { chat_id: chatId, message_id: validMsg.message_id, parse_mode: "Markdown" },
       )
     }
@@ -1371,7 +1340,7 @@ bot.onText(/\/ask\s+(.+)/s, async (msg, match) => {
   const chatId = msg.chat.id
   if (!isAllowed(msg.from.id)) return
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Already processing. /cancel to stop.")
+    bot.sendMessage(chatId, "Hold on, I'm still working on something. Use /cancel if you want me to stop.")
     return
   }
 
@@ -1390,7 +1359,7 @@ async function handleVoiceMessage(msg) {
     return
   }
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Still processing. /cancel to stop.")
+    bot.sendMessage(chatId, "Still working on it! /cancel if you want me to drop it.")
     return
   }
 
@@ -1405,7 +1374,7 @@ async function handleVoiceMessage(msg) {
   const fileId = msg.voice?.file_id || msg.audio?.file_id
   if (!fileId) return
 
-  const transcribeMsg = await bot.sendMessage(chatId, "🎙️ _Transcribing your voice..._", { parse_mode: "Markdown" })
+  const transcribeMsg = await bot.sendMessage(chatId, "🎙️ _Listening..._", { parse_mode: "Markdown" })
 
   try {
     // Download the audio file
@@ -1467,7 +1436,7 @@ async function handleVoiceMessage(msg) {
     })
 
     if (!transcription) {
-      bot.editMessageText("🎙️ Couldn't understand the audio. Try again?", {
+      bot.editMessageText("Hmm, I couldn't catch that 🎙️ Mind trying again?", {
         chat_id: chatId,
         message_id: transcribeMsg.message_id,
       })
@@ -1476,7 +1445,7 @@ async function handleVoiceMessage(msg) {
 
     // Show transcription, then delete it
     await bot.editMessageText(
-      `🎙️ *You said:*\n_"${transcription}"_`,
+      `🎙️ _"${transcription}"_`,
       { chat_id: chatId, message_id: transcribeMsg.message_id, parse_mode: "Markdown" },
     )
 
@@ -1513,7 +1482,8 @@ bot.on("message", async (msg) => {
   }
 
   if (!isAllowed(msg.from.id)) {
-    bot.sendMessage(chatId, "🔑 Use /setup to connect your Claude API key and get started.")
+    const guestName = msg.from.first_name || "there"
+    bot.sendMessage(chatId, `Hey ${guestName}! 👋 Use /setup to connect your account and we can get started.`)
     logger.security("Unauthorized access attempt", {
       userId: msg.from.id,
       username: msg.from.username,
@@ -1522,17 +1492,17 @@ bot.on("message", async (msg) => {
   }
 
   if (isRunning(chatId)) {
-    bot.sendMessage(chatId, "⏳ Still processing. /cancel to stop it.")
+    bot.sendMessage(chatId, "Hang tight, I'm still on it! /cancel to stop me.")
     return
   }
 
   if (isBlocked(msg.from.id)) {
-    bot.sendMessage(chatId, "🚫 Too many failed attempts. Try again later.")
+    bot.sendMessage(chatId, "Whoa, slow down! 😅 Give it a minute and try again.")
     return
   }
 
   if (isMessageTooLarge(userMessage)) {
-    bot.sendMessage(chatId, "⚠️ Message too large. Keep it under 50KB.")
+    bot.sendMessage(chatId, "That's a really long message! 😄 Could you shorten it a bit?")
     return
   }
 
@@ -1543,7 +1513,7 @@ bot.on("message", async (msg) => {
   }
 
   if (!canStartSession(msg.from.id)) {
-    bot.sendMessage(chatId, "⏳ You have too many concurrent sessions. Wait for one to finish.")
+    bot.sendMessage(chatId, "I've got my hands full right now! 🙌 Let me finish up first.")
     return
   }
 
@@ -1560,7 +1530,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
   // Get user's API key (admins can use system key)
   const userApiKey = userManager.getApiKey(userId)
   if (!userApiKey && !isAdmin(userId)) {
-    bot.sendMessage(chatId, "🔑 You need to connect your Claude API key first.\nUse /setup to get started.")
+    bot.sendMessage(chatId, "You'll need to connect your account first! Hit /setup and I'll walk you through it 🔑")
     return
   }
 
@@ -1570,7 +1540,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
   // Send initial status message (will be updated live)
   const statusMsg = await bot.sendMessage(
     chatId,
-    `⚡ *Working on it...* (${projectName})\n\n` +
+    `✨ *On it!* (${projectName})\n\n` +
       `📝 _${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}_`,
     { parse_mode: "Markdown" },
   )
@@ -1623,7 +1593,7 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
           }).join("\n")
 
           text =
-            `⚙️ *Working...* _(${elapsed}s, ${status.turns} step${status.turns > 1 ? "s" : ""})_\n\n` +
+            `⚙️ *Digging in...* _(${elapsed}s, ${status.turns} step${status.turns > 1 ? "s" : ""})_\n\n` +
             `${toolLines}`
         }
 
@@ -1632,9 +1602,9 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
           const toolLines = (status.tools || []).slice(-4).map(t => `  ${t}`).join("\n")
 
           text =
-            `💬 *Wrapping up...* _(${elapsed}s)_\n\n` +
+            `💬 *Almost there...* _(${elapsed}s)_\n\n` +
             (toolLines ? `${toolLines}\n\n` : "") +
-            `✍️ _Composing final response..._`
+            `✍️ _Putting it all together..._`
         }
 
         if (text) scheduleStatusUpdate(text)
