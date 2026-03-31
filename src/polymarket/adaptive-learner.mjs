@@ -84,6 +84,13 @@ for (const range of PRICE_RANGES) {
   `).run(range.label, range.min, range.max)
 }
 
+// Initialize category stats
+for (const cat of ["sports", "crypto", "politics", "economics", "geopolitical", "entertainment", "other"]) {
+  db.raw.prepare(`
+    INSERT OR IGNORE INTO pm_category_stats (category) VALUES (?)
+  `).run(cat)
+}
+
 const stmts = {
   getWeight: db.raw.prepare(`SELECT * FROM pm_strategy_weights WHERE strategy = ?`),
   getAllWeights: db.raw.prepare(`SELECT * FROM pm_strategy_weights ORDER BY weight DESC`),
@@ -104,6 +111,25 @@ const stmts = {
   `),
   getAllPriceRanges: db.raw.prepare(`SELECT * FROM pm_price_range_stats ORDER BY range_min`),
   addLesson: db.raw.prepare(`INSERT INTO pm_lessons (lesson_type, lesson, data) VALUES (?, ?, ?)`),
+
+  // Category tracking
+  getCategoryStats: db.raw.prepare(`SELECT * FROM pm_category_stats WHERE category = ?`),
+  getAllCategoryStats: db.raw.prepare(`SELECT * FROM pm_category_stats ORDER BY total_trades DESC`),
+  updateCategoryStats: db.raw.prepare(`
+    UPDATE pm_category_stats
+    SET total_trades = total_trades + 1,
+        wins = wins + ?,
+        total_pnl = total_pnl + ?,
+        confidence = ?
+    WHERE category = ?
+  `),
+
+  // Lessons querying — check if we've had repeated losses on similar markets
+  getRecentLosses: db.raw.prepare(`
+    SELECT lesson, data FROM pm_lessons
+    WHERE lesson_type IN ('big_loss', 'range_disabled', 'strategy_adjustment')
+    ORDER BY created_at DESC LIMIT 20
+  `),
 }
 
 // ── Core Learning Functions ─────────────────────────────────
@@ -123,17 +149,22 @@ export function learnFromTrade(trade) {
   // 2. Update price range stats
   updatePriceRangeStats(entryPrice, won, trade.pnl)
 
-  // 3. Record lesson if notable
+  // 3. Update category stats (if category provided)
+  if (trade.category) {
+    updateCategoryStats(trade.category, won, trade.pnl)
+  }
+
+  // 4. Record lesson if notable
   if (trade.pnl < -10) {
     stmts.addLesson.run("big_loss",
       `Lost $${Math.abs(trade.pnl).toFixed(2)} on ${strategy} at ${(entryPrice * 100).toFixed(0)}% — ${trade.close_reason || "unknown reason"}`,
-      JSON.stringify({ strategy, entryPrice, pnl: trade.pnl, reason: trade.close_reason }),
+      JSON.stringify({ strategy, entryPrice, pnl: trade.pnl, reason: trade.close_reason, category: trade.category }),
     )
   }
   if (trade.pnl > 10) {
     stmts.addLesson.run("big_win",
       `Won $${trade.pnl.toFixed(2)} on ${strategy} at ${(entryPrice * 100).toFixed(0)}%`,
-      JSON.stringify({ strategy, entryPrice, pnl: trade.pnl }),
+      JSON.stringify({ strategy, entryPrice, pnl: trade.pnl, category: trade.category }),
     )
   }
 }
@@ -208,6 +239,31 @@ function updatePriceRangeStats(price, won, pnl) {
   }
 }
 
+/**
+ * Update category performance stats
+ */
+function updateCategoryStats(category, won, pnl) {
+  const row = stmts.getCategoryStats.get(category)
+  if (!row) return
+
+  const newTrades = (row.total_trades || 0) + 1
+  const newWins = (row.wins || 0) + (won ? 1 : 0)
+  const winRate = newTrades > 0 ? newWins / newTrades : 0.5
+
+  // Confidence: starts at 0.5, adjusts toward actual win rate after enough data
+  const confidence = newTrades >= 5 ? winRate : 0.5
+
+  stmts.updateCategoryStats.run(won ? 1 : 0, pnl, confidence, category)
+
+  // Auto-lesson if category is consistently losing
+  if (newTrades >= 5 && winRate < 0.25) {
+    stmts.addLesson.run("category_weak",
+      `Category '${category}' only ${(winRate * 100).toFixed(0)}% win rate after ${newTrades} trades — reduce exposure`,
+      JSON.stringify({ category, winRate, trades: newTrades, pnl: row.total_pnl + pnl }),
+    )
+  }
+}
+
 // ── Query Functions ─────────────────────────────────────────
 
 /**
@@ -229,6 +285,51 @@ export function isPriceRangeSafe(price) {
 }
 
 /**
+ * Get confidence multiplier for a category (0.3 to 1.5)
+ * Used by Smart Brain to size bets based on past category performance
+ */
+export function getCategoryConfidence(category) {
+  const row = stmts.getCategoryStats.get(category)
+  if (!row || row.total_trades < 3) return 1.0 // Not enough data, neutral
+
+  // Scale: 0% win rate → 0.3x, 50% → 1.0x, 80%+ → 1.5x
+  const winRate = row.total_trades > 0 ? row.wins / row.total_trades : 0.5
+  if (winRate >= 0.7) return 1.5
+  if (winRate >= 0.5) return 1.0 + (winRate - 0.5) * 2 // 0.5→1.0, 0.7→1.4
+  if (winRate >= 0.3) return 0.6 + (winRate - 0.3) * 2 // 0.3→0.6, 0.5→1.0
+  return 0.3 // Below 30% win rate — barely trade this category
+}
+
+/**
+ * Check if we've had repeated losses on a similar pattern
+ * Returns a penalty multiplier (0.5 = halve bet, 1.0 = no penalty)
+ */
+export function getLessonPenalty(strategy, entryPrice) {
+  try {
+    const recentLosses = stmts.getRecentLosses.all()
+    let matchingLosses = 0
+
+    for (const lesson of recentLosses) {
+      if (!lesson.data) continue
+      try {
+        const data = JSON.parse(lesson.data)
+        // Check if same strategy and similar price range
+        if (data.strategy === strategy && Math.abs((data.entryPrice || 0) - entryPrice) < 0.1) {
+          matchingLosses++
+        }
+      } catch {}
+    }
+
+    // 3+ similar losses → halve the bet. 5+ → quarter it.
+    if (matchingLosses >= 5) return 0.25
+    if (matchingLosses >= 3) return 0.5
+    return 1.0
+  } catch {
+    return 1.0
+  }
+}
+
+/**
  * Get all strategy weights (for display)
  */
 export function getAllWeights() {
@@ -240,6 +341,13 @@ export function getAllWeights() {
  */
 export function getAllPriceRanges() {
   return stmts.getAllPriceRanges.all()
+}
+
+/**
+ * Get all category stats (for display)
+ */
+export function getAllCategoryStats() {
+  return stmts.getAllCategoryStats.all()
 }
 
 /**
@@ -271,11 +379,24 @@ export function generateLearningReport() {
     report += `${status} ${r.range_label}: ${winRate}% win (${r.total_trades} trades, ${r.total_pnl >= 0 ? "+" : ""}$${r.total_pnl.toFixed(2)})\n`
   }
 
+  // Category performance
+  const categories = getAllCategoryStats()
+  const activeCats = categories.filter(c => c.total_trades > 0)
+  if (activeCats.length > 0) {
+    report += `\n*Category Performance:*\n`
+    for (const c of activeCats) {
+      const winRate = c.total_trades > 0 ? (c.wins / c.total_trades * 100).toFixed(0) : 0
+      const conf = getCategoryConfidence(c.category)
+      const emoji = conf >= 1.2 ? "🔥" : conf >= 0.8 ? "✅" : conf >= 0.5 ? "⚠️" : "🚫"
+      report += `${emoji} ${c.category}: ${winRate}% win (${c.total_trades} trades, ${c.total_pnl >= 0 ? "+" : ""}$${c.total_pnl.toFixed(2)}) → ${(conf * 100).toFixed(0)}% sizing\n`
+    }
+  }
+
   // Recent lessons
   if (lessons.length > 0) {
     report += `\n*Recent Lessons:*\n`
     for (const l of lessons.slice(0, 5)) {
-      const icon = l.lesson_type === "big_win" ? "✅" : l.lesson_type === "big_loss" ? "❌" : "📝"
+      const icon = l.lesson_type === "big_win" ? "✅" : l.lesson_type === "big_loss" ? "❌" : l.lesson_type === "category_weak" ? "⚠️" : "📝"
       report += `${icon} ${l.lesson}\n`
     }
   }
@@ -287,7 +408,10 @@ export default {
   learnFromTrade,
   getStrategyWeight,
   isPriceRangeSafe,
+  getCategoryConfidence,
+  getLessonPenalty,
   getAllWeights,
   getAllPriceRanges,
+  getAllCategoryStats,
   generateLearningReport,
 }

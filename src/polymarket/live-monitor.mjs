@@ -26,11 +26,12 @@ import stream from "./realtime-stream.mjs"
 import negRisk from "./negrisk-scanner.mjs"
 
 // ── Config ──────────────────────────────────────────────────
-const SCAN_INTERVAL_MS = 5 * 60 * 1000  // Full scan every 5 min
-const PRICE_CHECK_MS = 60 * 1000        // Price check every 1 min
-const MIN_OPPORTUNITY_SCORE = 2          // Minimum score to alert
-const AUTO_SNIPE_THRESHOLD = 0.96        // Auto-buy above this price (4% max profit, very safe)
-const MAX_DAILY_TRADES = 20              // Don't overtrade
+const SCAN_INTERVAL_MS = 15 * 60 * 1000  // Full scan every 15 min (was 5m — too spammy)
+const PRICE_CHECK_MS = 2 * 60 * 1000     // Price check every 2 min (was 1m)
+const MIN_OPPORTUNITY_SCORE = 3           // Minimum score to alert (was 2 — too many low-quality alerts)
+const AUTO_SNIPE_THRESHOLD = 0.96         // Auto-buy above this price (4% max profit, very safe)
+const MAX_DAILY_TRADES = 20               // Don't overtrade
+const OPP_ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000  // Don't re-alert same opportunity for 4 hours
 
 let _bot = null
 let _chatId = null
@@ -40,6 +41,7 @@ let _priceInterval = null
 let _dailyTradeCount = 0
 let _lastScanResults = null
 let _watchlist = new Map()  // tokenId -> { market, targetPrice, direction, alertSent }
+let _alertedOpportunities = new Map()  // marketId -> timestamp (dedup alerts)
 
 // Reset daily trade count at midnight
 const midnightReset = setInterval(() => {
@@ -87,7 +89,8 @@ export async function start(bankroll = 100) {
     }
 
     stream.onTrade = (tradeData) => {
-      if (tradeData?.size > 10000) {
+      // Only alert on truly massive trades ($50K+), not every $10K order
+      if (tradeData?.size > 50000) {
         sendAlert(`🐋 *Whale Trade:* $${(tradeData.size / 1000).toFixed(0)}K detected`)
       }
     }
@@ -170,31 +173,48 @@ async function runFullScan(bankroll) {
     const newOpps = results.topPicks.filter((p) => p.score >= MIN_OPPORTUNITY_SCORE)
 
     if (newOpps.length > 0 && _bot && _chatId) {
-      // Check if these are genuinely new (not same as last alert)
+      // Only alert for NEW opportunities (not seen in last 4 hours)
+      const now = Date.now()
       const alertWorthy = newOpps.filter((opp) => {
-        // Only alert for high-score opportunities
-        if (opp.score < 3) return false
+        const marketId = opp.market?.id
+        if (!marketId) return false
+        const lastAlerted = _alertedOpportunities.get(marketId)
+        if (lastAlerted && now - lastAlerted < OPP_ALERT_COOLDOWN_MS) return false
         return true
       })
 
       if (alertWorthy.length > 0) {
+        // Mark as alerted
+        for (const opp of alertWorthy) {
+          if (opp.market?.id) _alertedOpportunities.set(opp.market.id, now)
+        }
         await sendOpportunityAlert(alertWorthy, bankroll)
       }
 
-      // Auto-execute safe trades if enabled
+      // Auto-execute safe trades (no dedup needed — these are action, not alerts)
       for (const opp of newOpps) {
         if (opp.strategy === "Resolution Snipe" && opp.price >= AUTO_SNIPE_THRESHOLD) {
           await autoExecuteSnipe(opp, bankroll)
         }
-        if (opp.strategy === "Arbitrage") {
-          await sendAlert(`⚖️ *ARBITRAGE FOUND*\n${opp.reasoning}`)
+        // Only alert arbitrage if genuinely new
+        if (opp.strategy === "Arbitrage" && opp.market?.id) {
+          const lastAlerted = _alertedOpportunities.get(opp.market.id)
+          if (!lastAlerted || now - lastAlerted >= OPP_ALERT_COOLDOWN_MS) {
+            _alertedOpportunities.set(opp.market.id, now)
+            await sendAlert(`⚖️ *ARBITRAGE FOUND*\n${opp.reasoning}`)
+          }
         }
       }
     }
-    // Check NegRisk arbitrage separately (highest priority — risk-free)
+    // Check NegRisk arbitrage separately (highest priority — risk-free, always alert)
     try {
       const negRiskAlerts = await negRisk.checkNegRiskChanges()
       for (const alert of negRiskAlerts) {
+        const eventId = alert.event.eventId
+        const lastAlerted = _alertedOpportunities.get(eventId)
+        if (lastAlerted && Date.now() - lastAlerted < OPP_ALERT_COOLDOWN_MS) continue
+        _alertedOpportunities.set(eventId, Date.now())
+
         await sendAlert(
           `⚖️ *NEW NEGRISK ARBITRAGE!*\n\n` +
             `*${alert.event.title}*\n` +
@@ -205,6 +225,12 @@ async function runFullScan(bankroll) {
         )
       }
     } catch {}
+
+    // Cleanup stale alert dedup entries (older than 2x cooldown)
+    const cutoff = Date.now() - OPP_ALERT_COOLDOWN_MS * 2
+    for (const [k, v] of _alertedOpportunities) {
+      if (v < cutoff) _alertedOpportunities.delete(k)
+    }
 
   } catch (err) {
     console.error("[PM-MONITOR] Scan error:", err.message)

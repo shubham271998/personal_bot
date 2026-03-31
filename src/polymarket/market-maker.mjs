@@ -16,7 +16,7 @@
  * Risk: Adverse selection (informed traders pick you off).
  * Mitigation: Wider spreads on volatile markets, position limits.
  */
-import axios from "axios"
+import api from "./api-client.mjs"
 
 const CLOB_API = "https://clob.polymarket.com"
 
@@ -24,7 +24,7 @@ const CLOB_API = "https://clob.polymarket.com"
  * Get current midpoint price for a token
  */
 export async function getMidpoint(tokenId) {
-  const { data } = await axios.get(`${CLOB_API}/midpoint`, {
+  const { data } = await api.get(`${CLOB_API}/midpoint`, {
     params: { token_id: tokenId },
     timeout: 5000,
   })
@@ -35,7 +35,7 @@ export async function getMidpoint(tokenId) {
  * Get best bid and ask
  */
 export async function getBestBidAsk(tokenId) {
-  const { data } = await axios.get(`${CLOB_API}/book`, {
+  const { data } = await api.get(`${CLOB_API}/book`, {
     params: { token_id: tokenId },
     timeout: 5000,
   })

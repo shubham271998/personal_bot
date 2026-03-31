@@ -11,7 +11,7 @@
  * This strategy extracted $29M in one year. 73% of all arbitrage profits.
  * Top arbitrageur made $2M from this alone.
  */
-import axios from "axios"
+import api from "./api-client.mjs"
 
 const GAMMA_API = "https://gamma-api.polymarket.com"
 
@@ -20,7 +20,7 @@ const GAMMA_API = "https://gamma-api.polymarket.com"
  */
 export async function getNegRiskEvents(limit = 100) {
   // Get events that use neg-risk (multi-outcome)
-  const { data } = await axios.get(`${GAMMA_API}/events`, {
+  const { data } = await api.get(`${GAMMA_API}/events`, {
     params: {
       limit,
       active: true,
@@ -46,12 +46,15 @@ export async function getNegRiskEvents(limit = 100) {
       const names = JSON.parse(m.outcomes || "[]")
       const tokens = JSON.parse(m.clobTokenIds || "[]")
 
-      if (prices.length >= 1) {
+      // Each market in a NegRisk event represents ONE outcome
+      // prices[0] = YES price for this outcome, prices[1] = NO price
+      // We want the YES price from each market, then sum across all markets
+      if (prices.length >= 1 && parseFloat(prices[0] || 0) > 0) {
         outcomes.push({
           marketId: m.id,
-          name: names[0] || m.question,
+          name: names[0] || m.question?.replace(event.title, "").trim() || m.question,
           yesPrice: parseFloat(prices[0] || 0),
-          noPrice: parseFloat(prices[1] || 1),
+          noPrice: parseFloat(prices[1] || 0) || (1 - parseFloat(prices[0] || 0)),
           yesTokenId: tokens[0] || null,
           noTokenId: tokens[1] || null,
           volume24hr: m.volume24hr || 0,
@@ -113,18 +116,24 @@ export async function findNegRiskArbitrage(minSpreadPct = 1.5) {
           })),
         }
       } else {
-        // Sum > $1: more complex, buy NO on everything
+        // Sum > $1: buy NO on every outcome
+        // In NegRisk: exactly 1 outcome resolves YES, rest resolve NO
+        // Each NO share costs noPrice, pays $1 if that outcome is NOT the winner
+        // If we buy NO on ALL outcomes: (n-1) shares pay out $1 each, 1 share pays $0
+        // Total cost = sum of all NO prices
+        // Total payout = n - 1 (one NO loses, rest win)
         const noCost = event.outcomes.reduce((sum, o) => sum + o.noPrice, 0)
-        const profit = event.outcomes.length - 1 - noCost // (n-1) NO tokens pay out
+        const payout = event.outcomes.length - 1
+        const profit = payout - noCost
         tradeDetails = {
           action: "Buy NO on ALL outcomes",
           totalCost: noCost,
-          guaranteedPayout: event.outcomes.length - 1,
+          guaranteedPayout: payout,
           profit: Math.max(0, profit),
-          profitPct: noCost > 0 ? ((profit / noCost) * 100).toFixed(2) : "0",
+          profitPct: noCost > 0 ? ((Math.max(0, profit) / noCost) * 100).toFixed(2) : "0",
           trades: event.outcomes.map((o) => ({
             name: o.name,
-            side: "BUY",
+            side: "BUY_NO",
             price: o.noPrice,
             tokenId: o.noTokenId,
           })),

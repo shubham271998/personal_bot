@@ -20,8 +20,8 @@ import db from "../database.mjs"
 // ── Deduplication — track what we've already notified/traded ─
 const _notifiedMarkets = new Map()  // marketId -> timestamp (last notified)
 const _tradedMarkets = new Set()    // marketId (already have a position)
-const NOTIFY_COOLDOWN_MS = 4 * 60 * 60 * 1000  // Don't re-notify same market for 4 hours
-const PREDICTION_COOLDOWN_MS = 2 * 60 * 60 * 1000  // Don't re-predict same market for 2 hours
+const NOTIFY_COOLDOWN_MS = 6 * 60 * 60 * 1000  // Don't re-notify same market for 6 hours
+const PREDICTION_COOLDOWN_MS = 4 * 60 * 60 * 1000  // Don't re-predict same market for 4 hours
 const _predictedMarkets = new Map() // marketId -> timestamp
 
 function shouldNotify(marketId) {
@@ -93,6 +93,26 @@ db.raw.exec(`
     created_at   TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS pm_decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id       TEXT,
+    market_question TEXT,
+    outcome         TEXT,
+    direction       TEXT,
+    estimated_prob  REAL,
+    market_price    REAL,
+    confidence      REAL,
+    real_edge       REAL,
+    score           REAL,
+    bet_size        REAL,
+    checks          TEXT,
+    reasoning       TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_decisions_market ON pm_decisions(market_id);
+  CREATE INDEX IF NOT EXISTS idx_decisions_date ON pm_decisions(created_at);
+
   CREATE TABLE IF NOT EXISTS pm_auto_watchlist (
     token_id     TEXT PRIMARY KEY,
     market_id    TEXT,
@@ -112,6 +132,10 @@ const stmts = {
   addPrediction: db.raw.prepare(`
     INSERT INTO pm_predictions (market_id, market_question, predicted_outcome, predicted_prob, market_price, confidence, reasoning)
     VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  addDecision: db.raw.prepare(`
+    INSERT INTO pm_decisions (market_id, market_question, outcome, direction, estimated_prob, market_price, confidence, real_edge, score, bet_size, checks, reasoning)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getOpenPredictions: db.raw.prepare(`SELECT * FROM pm_predictions WHERE status = 'open'`),
   evaluatePrediction: db.raw.prepare(`
@@ -273,6 +297,25 @@ export async function analyzeMarketSimple(market) {
  */
 export function recordPrediction(marketId, question, predictedOutcome, predictedProb, marketPrice, confidence, reasoning) {
   stmts.addPrediction.run(marketId, question, predictedOutcome, predictedProb, marketPrice, confidence, reasoning)
+}
+
+/**
+ * Record a full decision audit trail (checks, reasoning, edge, etc.)
+ */
+export function recordDecision(marketId, question, details) {
+  try {
+    stmts.addDecision.run(
+      marketId, question,
+      details.outcome || "", details.direction || "",
+      details.estimatedProb || 0, details.marketPrice || 0,
+      details.confidence || 0, details.realEdge || 0,
+      details.score || 0, details.betSize || 0,
+      JSON.stringify(details.checks || {}),
+      JSON.stringify(details.reasoning || []),
+    )
+  } catch (err) {
+    console.error("[DECISION] Failed to record:", err.message)
+  }
 }
 
 /**
@@ -458,6 +501,7 @@ db.raw.exec(`
     status       TEXT DEFAULT 'open',
     exit_price   REAL,
     pnl          REAL DEFAULT 0,
+    close_reason TEXT,
     created_at   TEXT DEFAULT (datetime('now')),
     closed_at    TEXT
   );
@@ -480,6 +524,11 @@ db.raw.exec(`
   );
 `)
 
+// Migration: add close_reason column to existing tables
+try {
+  db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN close_reason TEXT`)
+} catch {} // Column already exists
+
 const virtualStmts = {
   openPosition: db.raw.prepare(`
     INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy)
@@ -487,7 +536,7 @@ const virtualStmts = {
   `),
   getOpenPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio WHERE status = 'open'`),
   closePosition: db.raw.prepare(`
-    UPDATE pm_virtual_portfolio SET status = 'closed', exit_price = ?, pnl = ?, closed_at = datetime('now')
+    UPDATE pm_virtual_portfolio SET status = 'closed', exit_price = ?, pnl = ?, close_reason = ?, closed_at = datetime('now')
     WHERE id = ?
   `),
   getAllPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio ORDER BY created_at DESC LIMIT ?`),
@@ -665,57 +714,92 @@ async function checkVirtualPositions() {
           currentPrice = 1.0
           shouldClose = true
           closeReason = "snipe-won"
-        } else if (currentPrice < pos.entry_price * 0.90) {
-          // Snipe went wrong — cut loss
+        } else if (currentPrice < pos.entry_price * 0.93) {
+          // Snipe went wrong — tighter stop for snipes (7% loss max)
           shouldClose = true
           closeReason = "snipe-failed"
         }
       }
 
-      // 3. Take profit: price moved +15% from entry
-      if (!shouldClose && pos.strategy !== "Resolution Snipe") {
-        if (currentPrice >= pos.entry_price + 0.15) {
-          shouldClose = true
-          closeReason = "take-profit"
-        }
-      }
-
-      // 4. Stop loss: -30% for risky, -15% for medium
+      // 3. Dynamic take profit with trailing stop logic
       if (!shouldClose && pos.strategy !== "Resolution Snipe" && pos.strategy !== "Arbitrage") {
-        const stopPct = pos.strategy === "Long Shot" ? 0.50 : 0.70
-        if (currentPrice < pos.entry_price * stopPct) {
+        const gain = currentPrice - pos.entry_price
+        const gainPct = gain / pos.entry_price
+
+        // Trailing stop: the more we're up, the tighter the stop
+        if (gainPct >= 0.25) {
+          // Up 25%+: take profit — lock in the big win
           shouldClose = true
-          closeReason = `stop-loss (${((1 - stopPct) * 100).toFixed(0)}%)`
+          closeReason = `take-profit (+${(gainPct * 100).toFixed(0)}%)`
+        } else if (gainPct >= 0.15) {
+          // Up 15-25%: trailing stop at -5% from current (lock in most gains)
+          // We don't have peak tracking in DB, so just take profit at +15%
+          shouldClose = true
+          closeReason = `take-profit (+${(gainPct * 100).toFixed(0)}%)`
+        } else if (gainPct >= 0.10 && currentPrice >= 0.85) {
+          // Up 10%+ and near resolution territory — take the safe gain
+          shouldClose = true
+          closeReason = `take-profit-near-resolution (+${(gainPct * 100).toFixed(0)}%)`
         }
       }
 
-      // 5. Long shots at 0 → write off
-      if (!shouldClose && pos.strategy === "Long Shot" && currentPrice <= 0.005) {
+      // 4. Dynamic stop loss based on strategy risk profile
+      if (!shouldClose && pos.strategy !== "Resolution Snipe" && pos.strategy !== "Arbitrage") {
+        const lossPct = (pos.entry_price - currentPrice) / pos.entry_price
+
+        if (pos.strategy === "Smart Brain") {
+          // Smart Brain: 20% stop loss (tighter than before)
+          if (lossPct >= 0.20) {
+            shouldClose = true
+            closeReason = "stop-loss (-20%)"
+          }
+        } else if (pos.strategy === "News Alpha" || pos.strategy === "Momentum") {
+          // Medium risk: 25% stop
+          if (lossPct >= 0.25) {
+            shouldClose = true
+            closeReason = `stop-loss (-25%)`
+          }
+        } else {
+          // Default: 30% stop
+          if (lossPct >= 0.30) {
+            shouldClose = true
+            closeReason = `stop-loss (-30%)`
+          }
+        }
+      }
+
+      // 5. Dead positions: price collapsed to near zero
+      if (!shouldClose && currentPrice <= 0.005) {
         currentPrice = 0
         shouldClose = true
         closeReason = "expired-worthless"
       }
 
-      // 6. Stale positions: close sooner to free up capital for new learning
+      // 6. Stale positions: close to free up capital
       if (!shouldClose) {
         const ageHours = (Date.now() - new Date(pos.created_at).getTime()) / 3600000
-        if (ageHours > 72) { // 3 days (was 7) — faster capital recycling
+        // Different staleness thresholds by strategy
+        const maxAge = pos.strategy === "Resolution Snipe" ? 48 : // Snipes should resolve fast
+                       pos.strategy === "Arbitrage" ? 24 : // Arb should be instant
+                       72 // Smart Brain: 3 days
+        if (ageHours > maxAge) {
           shouldClose = true
-          closeReason = "stale (7+ days)"
+          closeReason = `stale (${Math.round(maxAge / 24)}+ days)`
         }
       }
 
       if (shouldClose) {
         const pnl = (currentPrice - pos.entry_price) * pos.shares
-        virtualStmts.closePosition.run(currentPrice, pnl, pos.id)
+        virtualStmts.closePosition.run(currentPrice, pnl, closeReason, pos.id)
         closed.push({ ...pos, exit_price: currentPrice, pnl, close_reason: closeReason })
 
-        // LEARN from this trade — adjust weights for future
+        // LEARN from this trade — adjust strategy weights, price range, and category stats
         adaptiveLearner.learnFromTrade({
           strategy: pos.strategy,
           entry_price: pos.entry_price,
           pnl,
           close_reason: closeReason,
+          category: smartBrain.detectCategory(pos.market_question || ""),
         })
         _tradedMarkets.delete(pos.market_id) // Allow re-trading this market
 
@@ -840,25 +924,25 @@ export function startAutonomous() {
 
   console.log("[AUTO-ANALYST] Started autonomous mode with virtual trading")
 
-  // Initial briefing after 30 seconds
-  setTimeout(() => sendBriefing(), 30000)
+  // Initial briefing after 2 minutes (let everything warm up)
+  setTimeout(() => sendBriefing(), 2 * 60 * 1000)
 
-  // Briefing every 2 hours
-  _briefingInterval = setInterval(() => sendBriefing(), 2 * 60 * 60 * 1000)
+  // Briefing every 4 hours (was 2h — too frequent, same data)
+  _briefingInterval = setInterval(() => sendBriefing(), 4 * 60 * 60 * 1000)
 
-  // Virtual trade + evaluate every 10 minutes
-  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 5 * 60 * 1000) // Every 5 min in learning mode
-  setTimeout(() => runVirtualTradingCycle(), 60000) // First run after 1 min
+  // Virtual trade cycle every 15 minutes (was 5m — too frequent, spams on every close/open)
+  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 15 * 60 * 1000)
+  setTimeout(() => runVirtualTradingCycle(), 3 * 60 * 1000) // First run after 3 min
 
-  // Evaluate predictions every 30 minutes
-  _evalInterval = setInterval(() => runEvaluation(), 30 * 60 * 1000)
+  // Evaluate predictions every 1 hour (was 30m — evaluations rarely change faster)
+  _evalInterval = setInterval(() => runEvaluation(), 60 * 60 * 1000)
 
-  // Auto-manage watchlist every 15 minutes
-  _watchlistInterval = setInterval(() => runWatchlistUpdate(), 15 * 60 * 1000)
-  setTimeout(() => runWatchlistUpdate(), 10000)
+  // Auto-manage watchlist every 2 hours (was 15m — the biggest spam source, silently manage)
+  _watchlistInterval = setInterval(() => runWatchlistUpdate(), 2 * 60 * 60 * 1000)
+  setTimeout(() => runWatchlistUpdate(), 60000) // First run after 1 min (silent)
 
-  // Daily scorecard at end of day (every 6 hours to not miss it)
-  _scorecardInterval = setInterval(() => sendScorecard(), 6 * 60 * 60 * 1000)
+  // Daily scorecard every 12 hours (was 6h — twice a day is enough)
+  _scorecardInterval = setInterval(() => sendScorecard(), 12 * 60 * 60 * 1000)
 
   return true
 }
@@ -909,22 +993,31 @@ async function runEvaluation() {
 
       await safeSend(_bot, _chatId, msg)
     }
+
+    // Run Brier score + self-improvement report periodically (writes to pm_brier_scores)
+    const evaluatedPreds = db.raw.prepare(
+      `SELECT COUNT(*) as c FROM pm_predictions WHERE status = 'evaluated'`
+    ).get()
+    if (evaluatedPreds && evaluatedPreds.c >= 3) {
+      try {
+        selfImprover.generateImprovementReport()
+        console.log("[EVAL] Brier scores and strategy scores updated")
+      } catch (err) {
+        console.error("[EVAL] Improvement report error:", err.message)
+      }
+    }
   } catch (err) {
     console.error("[AUTO-ANALYST] Eval error:", err.message)
   }
 }
 
 async function runWatchlistUpdate() {
-  if (!_bot || !_chatId) return
+  // Silently manage watchlist — no Telegram message needed
+  // Users can check with /pmauto when they want to see it
   try {
     const result = await autoManageWatchlist()
-    if (result.added.length > 0) {
-      await safeSend(_bot, _chatId,
-        `👀 Watchlist Updated\n\n` +
-          `Added ${result.added.length} markets:\n` +
-          result.added.map((a) => `• ${escapeMarkdown(a)}`).join("\n") +
-          `\n\n📊 Total watching: ${result.total}`,
-      )
+    if (result.added.length > 0 || result.removed.length > 0) {
+      console.log(`[WATCHLIST] +${result.added.length} -${result.removed.length} = ${result.total} total`)
     }
   } catch (err) {
     console.error("[AUTO-ANALYST] Watchlist error:", err.message)
@@ -937,27 +1030,8 @@ async function runVirtualTradingCycle() {
   try {
     // 1. Check and close resolved positions
     const closed = await checkVirtualPositions()
-    if (closed.length > 0) {
-      const totalPnl = closed.reduce((s, c) => s + c.pnl, 0)
-      const lines = closed.map((c) => {
-        const icon = c.pnl >= 0 ? "✅" : "❌"
-        const reason = c.close_reason ? ` (${c.close_reason})` : ""
-        return `${icon} ${c.outcome.slice(0, 25)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}${reason}`
-      })
 
-      const tag = process.platform === "darwin" ? "🏠" : "☁️"
-      const pnlStats = virtualStmts.getVirtualPnL.get()
-      const balance = VIRTUAL_BANKROLL + (pnlStats?.total_pnl || 0)
-
-      await safeSend(_bot, _chatId,
-        `${tag} *Positions Closed*\n\n${lines.join("\n")}\n\n` +
-          `Session P&L: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}\n` +
-          `Balance: $${balance.toFixed(2)} / $${VIRTUAL_BANKROLL}\n` +
-          `Win rate: ${pnlStats?.total_trades > 0 ? (pnlStats.wins / pnlStats.total_trades * 100).toFixed(0) : 0}%`,
-      )
-    }
-
-    // 2. Run SMART BRAIN scan (replaces dumb strategy scan)
+    // 2. Run SMART BRAIN scan
     const pnlData = virtualStmts.getVirtualPnL.get()
     const currentBalance = VIRTUAL_BANKROLL + (pnlData?.total_pnl || 0)
     const openPositions = virtualStmts.getOpenPositions.all()
@@ -973,6 +1047,12 @@ async function runVirtualTradingCycle() {
       const price = pick.market.outcomes?.find(o => o.name === pick.outcome)?.price || 0.5
       if (price <= 0.01 || price >= 0.99) continue
 
+      // Check if this price range is safe (learned from past losses)
+      if (!adaptiveLearner.isPriceRangeSafe(price)) {
+        console.log(`[BRAIN] Skipped: ${(pick.outcome || "").slice(0, 25)} — price range ${(price * 100).toFixed(0)}% disabled by learner`)
+        continue
+      }
+
       const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
       if (betSize < 2 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
 
@@ -982,30 +1062,54 @@ async function runVirtualTradingCycle() {
         virtualStmts.openPosition.run(
           pick.market.id, (pick.market.question || "").slice(0, 200),
           pick.outcome || "YES", pick.direction || "BUY",
-          price, shares, betSize, "Smart Brain",
+          price, shares, betSize, pick.strategy || "Smart Brain",
         )
         _tradedMarkets.add(pick.market.id)
         tradesPlaced++
-        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${(pick.confidence * 100).toFixed(0)}% conf)`)
+        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy})`)
       } catch (err) {
         console.error(`[BRAIN] Trade failed:`, err.message)
       }
     }
 
+    // 3. Send ONE combined message if anything happened (closes + opens)
     const tag = process.platform === "darwin" ? "🏠" : "☁️"
-    if (tradesPlaced > 0) {
-      const allOpen = virtualStmts.getOpenPositions.all()
-      const recent = allOpen.slice(-tradesPlaced)
-      const lines = recent.map((p) =>
-        `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)}`,
-      )
-      await safeSend(_bot, _chatId,
-        `${tag} *Smart Trade* (${brainScan.approved.length} approved / ${brainScan.skipped} skipped)\n\n${lines.join("\n")}\n\n` +
-          `_Checks: edge>7%, no longshot bias, whale + news confirmed_`,
-      )
-    } else if (brainScan.approved.length === 0) {
-      // Every few cycles, report that we're watching but not trading
-      console.log(`[BRAIN] No trades — all ${brainScan.total} markets failed quality checks`)
+    const hasActivity = closed.length > 0 || tradesPlaced > 0
+
+    if (hasActivity) {
+      const pnlStats = virtualStmts.getVirtualPnL.get()
+      const balance = VIRTUAL_BANKROLL + (pnlStats?.total_pnl || 0)
+      let msg = `${tag} *Trading Update*\n\n`
+
+      // Closed positions
+      if (closed.length > 0) {
+        const totalClosePnl = closed.reduce((s, c) => s + c.pnl, 0)
+        msg += `*Closed:*\n`
+        for (const c of closed) {
+          const icon = c.pnl >= 0 ? "✅" : "❌"
+          const reason = c.close_reason ? ` (${c.close_reason})` : ""
+          msg += `${icon} ${c.outcome.slice(0, 25)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}${reason}\n`
+        }
+        msg += `Close P&L: ${totalClosePnl >= 0 ? "+" : ""}$${totalClosePnl.toFixed(2)}\n\n`
+      }
+
+      // New trades
+      if (tradesPlaced > 0) {
+        const allOpen = virtualStmts.getOpenPositions.all()
+        const recent = allOpen.slice(-tradesPlaced)
+        msg += `*Opened:*\n`
+        for (const p of recent) {
+          msg += `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})\n`
+        }
+        msg += `\n`
+      }
+
+      msg += `*Balance:* $${balance.toFixed(2)} | Win: ${pnlStats?.total_trades > 0 ? (pnlStats.wins / pnlStats.total_trades * 100).toFixed(0) : 0}% | Open: ${virtualStmts.getOpenPositions.all().length}`
+
+      await safeSend(_bot, _chatId, msg)
+    } else {
+      // Nothing happened — just log, don't message
+      console.log(`[BRAIN] Cycle: scanned ${brainScan.total}, approved ${brainScan.approved.length}, no new trades`)
     }
 
     // 3. Record predictions from brain-approved picks (deduplicated)
@@ -1018,11 +1122,29 @@ async function runVirtualTradingCycle() {
       const question = pick.market?.question || ""
       const reasoning = (pick.reasoning || []).join("; ")
 
+      // Use estimatedProb (actual probability) not confidence (checks/7 ratio)
+      const predictedProb = pick.estimatedProb || marketPrice
+      const checksConfidence = pick.confidence || 0.5
+
       recordPrediction(
         mId, question.slice(0, 200),
-        outcome, pick.confidence || 0.5, marketPrice,
-        pick.confidence || 0.5, reasoning.slice(0, 300),
+        outcome, predictedProb, marketPrice,
+        checksConfidence, reasoning.slice(0, 500),
       )
+
+      // Also store full decision details
+      recordDecision(mId, question.slice(0, 200), {
+        outcome,
+        estimatedProb: predictedProb,
+        marketPrice,
+        confidence: checksConfidence,
+        realEdge: pick.realEdge || 0,
+        score: pick.score || 0,
+        betSize: pick.betSize || 0,
+        direction: pick.direction,
+        checks: pick.checksDetail || {},
+        reasoning: (pick.reasoning || []).slice(0, 10),
+      })
     }
   } catch (err) {
     console.error("[AUTO-ANALYST] Virtual trading error:", err.message)

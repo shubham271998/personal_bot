@@ -59,7 +59,7 @@ export async function setupTables() {
       market_id TEXT, market_question TEXT, outcome TEXT, side TEXT,
       entry_price REAL, shares REAL, size_usdc REAL, strategy TEXT,
       status TEXT DEFAULT 'open', exit_price REAL, pnl REAL DEFAULT 0,
-      created_at TEXT, closed_at TEXT
+      close_reason TEXT, created_at TEXT, closed_at TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS pm_predictions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +94,13 @@ export async function setupTables() {
       accuracy REAL, avg_confidence REAL, calibration_error REAL,
       profit_score REAL, notes TEXT, created_at TEXT
     )`,
+    `CREATE TABLE IF NOT EXISTS pm_decisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      market_id TEXT, market_question TEXT, outcome TEXT, direction TEXT,
+      estimated_prob REAL, market_price REAL, confidence REAL,
+      real_edge REAL, score REAL, bet_size REAL,
+      checks TEXT, reasoning TEXT, created_at TEXT
+    )`,
   ]
 
   for (const sql of tables) {
@@ -121,9 +128,9 @@ export async function syncToCloud(localDb) {
     for (const t of closedTrades) {
       try {
         await client.execute({
-          sql: `INSERT OR REPLACE INTO pm_virtual_portfolio (id, market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, status, exit_price, pnl, created_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [t.id, t.market_id, t.market_question, t.outcome, t.side, t.entry_price, t.shares, t.size_usdc, t.strategy, t.status, t.exit_price, t.pnl, t.created_at, t.closed_at],
+          sql: `INSERT OR REPLACE INTO pm_virtual_portfolio (id, market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, status, exit_price, pnl, close_reason, created_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [t.id, t.market_id, t.market_question, t.outcome, t.side, t.entry_price, t.shares, t.size_usdc, t.strategy, t.status, t.exit_price, t.pnl, t.close_reason, t.created_at, t.closed_at],
         })
         synced++
       } catch {}
@@ -192,6 +199,36 @@ export async function syncToCloud(localDb) {
         synced++
       } catch {}
     }
+
+    // Sync eval scores
+    try {
+      const evals = localDb.prepare(`SELECT * FROM pm_eval_scores ORDER BY id DESC LIMIT 20`).all()
+      for (const e of evals) {
+        try {
+          await client.execute({
+            sql: `INSERT OR IGNORE INTO pm_eval_scores (id, period, total_predictions, correct, accuracy, avg_confidence, calibration_error, profit_score, notes, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [e.id, e.period, e.total_predictions, e.correct, e.accuracy, e.avg_confidence, e.calibration_error, e.profit_score, e.notes, e.created_at],
+          })
+          synced++
+        } catch {}
+      }
+    } catch {}
+
+    // Sync decisions (recent 50)
+    try {
+      const decisions = localDb.prepare(`SELECT * FROM pm_decisions ORDER BY id DESC LIMIT 50`).all()
+      for (const d of decisions) {
+        try {
+          await client.execute({
+            sql: `INSERT OR IGNORE INTO pm_decisions (id, market_id, market_question, outcome, direction, estimated_prob, market_price, confidence, real_edge, score, bet_size, checks, reasoning, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [d.id, d.market_id, d.market_question, d.outcome, d.direction, d.estimated_prob, d.market_price, d.confidence, d.real_edge, d.score, d.bet_size, d.checks, d.reasoning, d.created_at],
+          })
+          synced++
+        } catch {}
+      }
+    } catch {}
   } catch (err) {
     console.error("[CLOUD-DB] Sync error:", err.message)
   }
@@ -258,7 +295,7 @@ export async function getStats() {
   if (!client) return null
 
   try {
-    const tables = ["pm_virtual_portfolio", "pm_predictions", "pm_lessons", "pm_strategy_weights", "pm_brier_scores"]
+    const tables = ["pm_virtual_portfolio", "pm_predictions", "pm_lessons", "pm_strategy_weights", "pm_brier_scores", "pm_eval_scores", "pm_decisions"]
     const stats = {}
     for (const table of tables) {
       try {

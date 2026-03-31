@@ -17,6 +17,8 @@ import scanner from "./market-scanner.mjs"
 import newsAnalyzer from "./news-analyzer.mjs"
 import selfImprover from "./self-improver.mjs"
 import adaptiveLearner from "./adaptive-learner.mjs"
+import strategyEngine from "./strategy-engine.mjs"
+import researcher from "./web-researcher.mjs"
 
 // ── Constants from research ─────────────────────────────────
 
@@ -48,6 +50,32 @@ const CATASTROPHE_RESERVE = 0.20
 const MAX_DRAWDOWN = 0.15
 // Livermore: need 2+ confirming signals
 const MIN_SIGNALS = 2
+
+// ── Category Detection ─────────────────────────────────────
+
+const CATEGORY_PATTERNS = {
+  sports: /\bvs\.?\b|versus|match|game\s+\d|nba|nfl|nhl|mlb|premier\s+league|la\s+liga|bundesliga|serie\s+a|ufc|boxing|tennis|cricket|esports|bo[1-5]|playoff|championship|super\s+bowl|world\s+cup|world\s+series|stanley\s+cup|\b(lakers|celtics|warriors|chiefs|eagles|devils|hurricanes|kraken|sabres|canucks|flames|yankees|dodgers)\b/i,
+  crypto: /\bbitcoin\b|btc|\betherea?um\b|eth|\bsolana\b|sol|\bcrypto\b|token|defi|blockchain|nft|stablecoin|altcoin|mining|halving|\b(doge|xrp|ada|bnb|avax|matic|dot)\b/i,
+  politics: /\belection\b|president|congress|senate|house|democrat|republican|gop|vote|ballot|poll|governor|mayor|primary|nomination|campaign|cabinet|impeach|legislation|bill\s+pass/i,
+  economics: /\bfed\b|interest\s+rate|inflation|gdp|jobs?\s+report|unemployment|cpi|ppi|fomc|treasury|tariff|trade\s+war|recession|stimulus|monetary\s+policy|bps\b|basis\s+points/i,
+  geopolitical: /\bwar\b|military|missile|invasion|sanction|nato|attack|ceasefire|peace\s+deal|nuclear|troops|drone\s+strike|escalat/i,
+  entertainment: /\boscar|grammy|emmy|box\s+office|movie|album|artist|celebrity|award|netflix|disney/i,
+}
+
+// Categories where we can have edge via news/data analysis
+const TRADEABLE_CATEGORIES = new Set(["crypto", "politics", "economics", "geopolitical"])
+// Categories we can only trade on near-resolution (>90% or <10%) for snipe profit
+const SNIPE_ONLY_CATEGORIES = new Set(["sports", "entertainment"])
+
+/**
+ * Detect market category from question text
+ */
+function detectCategory(question) {
+  for (const [cat, pattern] of Object.entries(CATEGORY_PATTERNS)) {
+    if (pattern.test(question)) return cat
+  }
+  return "other"
+}
 
 /**
  * Correct for favorite-longshot bias
@@ -113,16 +141,17 @@ function calculateRealEdge(estimatedProb, marketPrice, market) {
 /**
  * Should we trade this market? The main brain function.
  *
- * Returns: { shouldTrade, direction, confidence, betSize, reasoning }
+ * Returns: { shouldTrade, direction, confidence, betSize, reasoning, estimatedProb, ... }
  *
- * This function asks 7 questions before allowing a trade:
- *   1. Is there a real edge after costs?
- *   2. Is the market efficiently priced?
- *   3. Am I falling for longshot bias?
- *   4. What does the news say?
- *   5. What are whales doing?
- *   6. Has this strategy been profitable historically?
- *   7. Is this a good time to trade?
+ * This function asks 8 questions before allowing a trade:
+ *   1. Do I understand this market category?
+ *   2. Is there a real edge after costs?
+ *   3. Is the market efficiently priced?
+ *   4. Am I falling for longshot bias?
+ *   5. What does the news say?
+ *   6. What are whales doing?
+ *   7. Has this strategy been profitable historically?
+ *   8. Is this a good time to trade?
  */
 export async function evaluateMarket(market, bankroll = 1000) {
   const result = {
@@ -130,17 +159,24 @@ export async function evaluateMarket(market, bankroll = 1000) {
     direction: null,
     outcome: null,
     confidence: 0,
+    estimatedProb: 0,
+    realEdge: 0,
     betSize: 0,
     reasoning: [],
     score: 0,
+    category: "other",
+    checksDetail: {},
     checks: {
+      categoryCheck: false,
       edgeCheck: false,
       efficiencyCheck: false,
       biasCheck: false,
       newsCheck: false,
       whaleCheck: false,
+      researchCheck: false,
       historyCheck: false,
       timingCheck: false,
+      priceRangeCheck: false,
     },
   }
 
@@ -152,10 +188,51 @@ export async function evaluateMarket(market, bankroll = 1000) {
 
   const yesPrice = market.outcomes[0].price
   const noPrice = market.outcomes[1]?.price || 1 - yesPrice
+  const question = market.question || ""
 
-  // ── Check 1: Is the market in the sweet spot? ──────────────
-  // Research: $10K-$100K volume = inefficient (61% accuracy) = our edge
-  // $500K+ = efficiently priced = no edge = skip
+  // ── Check 0: Category — do I understand this market? ──────
+  const category = detectCategory(question)
+  result.category = category
+
+  // Research is EXPENSIVE (web search, API calls) — only run for promising markets
+  // Defer research until after cheap checks pass
+  let research = null
+
+  if (SNIPE_ONLY_CATEGORIES.has(category)) {
+    const isSnipeTerritory = yesPrice >= 0.93 || yesPrice <= 0.07
+    const hasOddsEdge = research?.signals?.some(s => s.source === "odds_comparison" && s.strength >= 0.3)
+
+    if (!isSnipeTerritory && !hasOddsEdge) {
+      // Sports: skip UNLESS sportsbook odds show mispricing or near resolution
+      result.reasoning.push(`${category.toUpperCase()} market — no sportsbook edge, not near resolution`)
+      result.checks.categoryCheck = false
+      result.checksDetail = { ...result.checks }
+      return result
+    }
+    if (hasOddsEdge) {
+      result.reasoning.push(`${category.toUpperCase()} market — sportsbook odds show edge!`)
+    } else {
+      result.reasoning.push(`${category.toUpperCase()} market — snipe territory (${(yesPrice * 100).toFixed(0)}%)`)
+    }
+    result.checks.categoryCheck = true
+  } else if (TRADEABLE_CATEGORIES.has(category)) {
+    result.checks.categoryCheck = true
+    result.reasoning.push(`${category} market — news/data edge possible`)
+  } else {
+    result.checks.categoryCheck = true
+    result.reasoning.push(`Uncategorized market — proceeding cautiously`)
+  }
+
+  // ── Check 1: Price range safety (learned from past) ────────
+  if (!adaptiveLearner.isPriceRangeSafe(yesPrice)) {
+    result.reasoning.push(`Price range ${(yesPrice * 100).toFixed(0)}% disabled by adaptive learner — skip`)
+    result.checks.priceRangeCheck = false
+    result.checksDetail = { ...result.checks }
+    return result // Hard reject — we learned this range loses money
+  }
+  result.checks.priceRangeCheck = true
+
+  // ── Check 2: Is the market in the sweet spot? ──────────────
   if (isEfficientlyPriced(market)) {
     result.reasoning.push(`Too efficient ($${(market.volume24hr / 1000).toFixed(0)}K vol) — skip`)
     result.checks.efficiencyCheck = false
@@ -170,7 +247,7 @@ export async function evaluateMarket(market, bankroll = 1000) {
     result.reasoning.push("Moderate volume — may have edge")
   }
 
-  // ── Check 2: Am I falling for longshot bias? ──────────────
+  // ── Check 3: Am I falling for longshot bias? ──────────────
   if (yesPrice < 0.15 || noPrice < 0.15) {
     const corrected = correctLongshotBias(Math.min(yesPrice, noPrice))
     const displayed = Math.min(yesPrice, noPrice)
@@ -182,8 +259,9 @@ export async function evaluateMarket(market, bankroll = 1000) {
     result.checks.biasCheck = true
   }
 
-  // ── Check 3: Get news sentiment ───────────────────────────
+  // ── Check 4: Get news sentiment ───────────────────────────
   let newsSentiment = null
+  let newsSignalStrength = 0 // -1 to +1
   try {
     const headlines = await newsAnalyzer.searchNews(market.question.slice(0, 40), 6)
     if (headlines.length >= 2) {
@@ -195,50 +273,116 @@ export async function evaluateMarket(market, bankroll = 1000) {
             ? "🔴"
             : "⚪"
       result.reasoning.push(
-        `News ${sentEmoji} ${newsSentiment.sentiment} (${newsSentiment.bullish}B/${newsSentiment.bearish}R/${newsSentiment.neutral}N)`,
+        `News ${sentEmoji} ${newsSentiment.sentiment} (${newsSentiment.bullish}B/${newsSentiment.bearish}R/${newsSentiment.neutral}N, strength: ${(newsSentiment.strength * 100).toFixed(0)}%)`,
       )
-      result.checks.newsCheck = true
+
+      // News signal depends on category and strength
+      if (TRADEABLE_CATEGORIES.has(category) && newsSentiment.strength >= 0.3) {
+        newsSignalStrength = newsSentiment.sentiment === "bullish" ? newsSentiment.strength : -newsSentiment.strength
+        result.checks.newsCheck = true
+      } else if (newsSentiment.strength >= 0.5) {
+        // Very strong news signal even for unknown categories
+        newsSignalStrength = newsSentiment.sentiment === "bullish" ? newsSentiment.strength * 0.5 : -newsSentiment.strength * 0.5
+        result.checks.newsCheck = true
+      }
     }
   } catch {}
 
-  // ── Check 4: Whale activity ───────────────────────────────
+  // ── Check 5: Whale activity ───────────────────────────────
   let whaleSignal = 0
   try {
     const tokenId = market.outcomes[0].tokenId
     if (tokenId) {
       const whale = await selfImprover.detectWhaleActivity(tokenId)
       if (whale && whale.whaleDirection !== "NEUTRAL") {
-        whaleSignal = whale.whaleDirection === "BULLISH" ? 0.05 : -0.05
-        result.reasoning.push(
-          `Whales: ${whale.whaleDirection} (${(whale.ratio * 100).toFixed(0)}% buy pressure)`,
-        )
-        result.checks.whaleCheck = true
+        const whaleStrength = Math.abs(whale.ratio - 0.5) * 2 // 0 to 1
+        if (whaleStrength > 0.3) { // Only count strong whale signals
+          whaleSignal = whale.whaleDirection === "BULLISH" ? whaleStrength * 0.08 : -whaleStrength * 0.08
+          result.reasoning.push(
+            `Whales: ${whale.whaleDirection} (${(whale.ratio * 100).toFixed(0)}% buy pressure, strength ${(whaleStrength * 100).toFixed(0)}%)`,
+          )
+          result.checks.whaleCheck = true
+        }
       }
     }
   } catch {}
 
-  // ── Check 5: Historical strategy performance ──────────────
+  // ── Check 6: Trading window ───────────────────────────────
   const timingWindow = selfImprover.getTradingWindow()
   result.checks.timingCheck = timingWindow.quality !== "poor"
   if (!result.checks.timingCheck) {
     result.reasoning.push("Low liquidity window — bad time to trade")
   }
 
-  // ── Build probability estimate ────────────────────────────
-  let estimatedProb = yesPrice // Start with market price as base (respect the market)
-
-  // Adjust based on signals
-  if (newsSentiment) {
-    if (newsSentiment.sentiment === "bullish") estimatedProb += 0.05
-    if (newsSentiment.sentiment === "bearish") estimatedProb -= 0.05
+  // ── Check 7: Strategy weight from learner ─────────────────
+  const stratWeight = adaptiveLearner.getStrategyWeight("Smart Brain")
+  result.checks.historyCheck = stratWeight >= 0.3 // Strategy not killed
+  if (!result.checks.historyCheck) {
+    result.reasoning.push(`Smart Brain strategy weight too low (${(stratWeight * 100).toFixed(0)}%) — paused`)
   }
-  estimatedProb += whaleSignal
+
+  // ── Run research ONLY if cheap checks look promising ────────
+  // (saves API calls — only ~5-10 markets out of 80 reach here)
+  const cheapChecksPassed = [result.checks.categoryCheck, result.checks.priceRangeCheck,
+    result.checks.efficiencyCheck, result.checks.biasCheck, result.checks.historyCheck].filter(Boolean).length
+  if (cheapChecksPassed >= 3) {
+    try {
+      research = await researcher.researchMarket(market, category)
+      result.reasoning.push(`Researched: ${research?.sources?.length || 0} sources, ${research?.signals?.length || 0} signals`)
+    } catch {}
+  }
+
+  // ── Build probability estimate using ALL research signals ──
+  // Start with market price as base (respect the market — it's usually right)
+  let estimatedProb = yesPrice
+
+  // Adjust based on news
+  if (newsSentiment && newsSignalStrength !== 0) {
+    const newsImpact = newsSignalStrength * 0.08
+    estimatedProb += newsImpact
+    result.reasoning.push(`News shifts estimate by ${newsImpact > 0 ? "+" : ""}${(newsImpact * 100).toFixed(1)}%`)
+  }
+
+  // Adjust based on whale activity
+  if (whaleSignal !== 0) {
+    estimatedProb += whaleSignal
+    result.reasoning.push(`Whale signal shifts estimate by ${whaleSignal > 0 ? "+" : ""}${(whaleSignal * 100).toFixed(1)}%`)
+  }
+
+  // Adjust based on RESEARCH signals (web search, social, price momentum, odds, crypto)
+  if (research?.signals?.length > 0) {
+    result.checks.researchCheck = true
+    for (const sig of research.signals) {
+      const impact = sig.direction === "bullish" ? sig.strength * 0.06 : -sig.strength * 0.06
+      estimatedProb += impact
+      result.reasoning.push(`${sig.source}: ${sig.detail} (${impact > 0 ? "+" : ""}${(impact * 100).toFixed(1)}%)`)
+    }
+    // Sportsbook odds override — strongest signal for sports
+    const oddsSignal = research.signals.find(s => s.source === "odds_comparison")
+    if (oddsSignal && research.sportsbookOdds) {
+      // Sportsbook implied prob is the BEST estimate for sports
+      const bookProb = research.sportsbookOdds.impliedProbability
+      // Blend: 60% sportsbook, 40% market (books are sharper than PM for sports)
+      estimatedProb = bookProb * 0.6 + estimatedProb * 0.4
+      result.reasoning.push(`Sportsbook blend: ${(bookProb * 100).toFixed(0)}% book × 60% + ${(yesPrice * 100).toFixed(0)}% PM × 40%`)
+    }
+  } else {
+    result.checks.researchCheck = false
+  }
+
+  // Near-resolution: if price > 90%, increase probability estimate (momentum)
+  if (yesPrice > 0.90) {
+    estimatedProb = Math.max(estimatedProb, yesPrice + 0.02)
+    result.reasoning.push("Near resolution momentum — slight upward bias")
+  }
 
   // Clamp
   estimatedProb = Math.max(0.02, Math.min(0.98, estimatedProb))
+  result.estimatedProb = estimatedProb
 
   // ── Calculate real edge ───────────────────────────────────
   const realEdge = calculateRealEdge(estimatedProb, yesPrice, market)
+  result.realEdge = realEdge
 
   result.checks.edgeCheck = realEdge > MIN_EDGE_PCT
   if (!result.checks.edgeCheck) {
@@ -249,45 +393,37 @@ export async function evaluateMarket(market, bankroll = 1000) {
     result.reasoning.push(`Real edge: ${(realEdge * 100).toFixed(1)}% after costs ✅`)
   }
 
-  // ── Check 6: Strategy weight from learner ─────────────────
-  // (Will be applied by caller based on which strategy this falls into)
-  result.checks.historyCheck = true
-
   // ── Count confirming signals (Livermore rule: need 2+) ────
   let confirmingSignals = 0
   if (result.checks.edgeCheck) confirmingSignals++
   if (result.checks.newsCheck) confirmingSignals++
   if (result.checks.whaleCheck) confirmingSignals++
+  if (result.checks.researchCheck) confirmingSignals++ // web/social/odds/crypto research
   if (result.checks.efficiencyCheck) confirmingSignals++ // sweet spot = signal itself
 
   // ── Final Decision ────────────────────────────────────────
   const checksPassesd = Object.values(result.checks).filter(Boolean).length
   const totalChecks = Object.keys(result.checks).length
 
-  // VIRTUAL MODE: 3/7 checks + 1 confirming signal = trade (learn by doing)
-  // LIVE MODE: 5/7 checks + 2 confirming signals (strict)
-  const isVirtual = true // TODO: read from settings
-  const minChecks = isVirtual ? 3 : 5
-  const minSignals = isVirtual ? 1 : MIN_SIGNALS
-  const minEdge = isVirtual ? 0.03 : MIN_EDGE_PCT // 3% edge in virtual, 7% in live
+  // Unified thresholds — no more "learning mode" that lets garbage through
+  // Virtual or live, we need REAL edge to trade
+  const minChecks = 4 // At least 4/9 checks (was 3/7 — too loose)
+  const minEdge = 0.03 // 3% minimum edge after costs
+  const minSignals = 2 // Need 2+ confirming signals
 
   result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
 
-  if (isVirtual && !result.shouldTrade) {
-    // In virtual mode, take diverse bets to LEARN which patterns work
-    // The more data we collect, the faster the bot gets smart
-    if (realEdge > 0.01) {
-      result.shouldTrade = true
-      result.reasoning.push("📚 Learning trade — gathering data on this pattern")
-    } else if (checksPassesd >= 2 && market.volume24hr >= SWEET_SPOT_MIN) {
-      // Even without clear edge, take tiny bets on interesting markets to learn
-      result.shouldTrade = true
-      result.betSize = 2 // Minimum bet — pure learning
-      result.reasoning.push("📚 Exploration bet ($2) — testing if this market type is predictable")
-    }
-  }
+  // NO more "learning override" — learning comes from predictions, not from losing money
+  // Instead: record ALL evaluations as predictions for Brier scoring regardless of trade
   result.confidence = checksPassesd / totalChecks
-  result.score = realEdge * 100 * result.confidence
+  result.checksDetail = { ...result.checks }
+  result.researchSummary = research ? {
+    sources: research.sources?.length || 0,
+    signals: research.signals?.length || 0,
+    direction: research.overallDirection,
+    sportsbookEdge: research.sportsbookOdds ? (research.sportsbookOdds.impliedProbability - yesPrice).toFixed(3) : null,
+  } : null
+  result.score = realEdge * 100 * result.confidence * (TRADEABLE_CATEGORIES.has(category) ? 1.2 : 0.8)
 
   if (result.shouldTrade) {
     // Determine direction
@@ -308,34 +444,40 @@ export async function evaluateMarket(market, bankroll = 1000) {
       const deployable = bankroll * (1 - CATASTROPHE_RESERVE)
       const odds = result.direction === "BUY_YES" ? 1 / yesPrice - 1 : 1 / noPrice - 1
       const kelly = Math.max(0, (realEdge * odds - (1 - estimatedProb)) / odds)
-      const stratWeight = adaptiveLearner.getStrategyWeight("Smart Brain")
       const timeMultiplier = timingWindow.sizeMultiplier
+
+      // Category-based sizing from LEARNED performance (not just hardcoded)
+      const categoryMultiplier = adaptiveLearner.getCategoryConfidence(category)
+
+      // Lesson penalty: if we've lost repeatedly on similar trades, reduce size
+      const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
+
       result.betSize = Math.min(
         deployable * 0.05, // Max 5% of deployable (not total bankroll)
-        kelly * 0.25 * deployable * stratWeight * timeMultiplier,
+        kelly * 0.25 * deployable * stratWeight * timeMultiplier * categoryMultiplier * lessonPenalty,
       )
-      result.betSize = Math.max(2, Math.round(result.betSize * 100) / 100)
-      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)} (Kelly ${(kelly * 100).toFixed(1)}% × 0.25 × ${(stratWeight * 100).toFixed(0)}% strat × ${(timeMultiplier * 100).toFixed(0)}% time)`)
+      result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100) // Min $3
+      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)} (Kelly ${(kelly * 100).toFixed(1)}% × strat ${(stratWeight * 100).toFixed(0)}% × cat ${(categoryMultiplier * 100).toFixed(0)}% × lesson ${(lessonPenalty * 100).toFixed(0)}%)`)
     }
   }
 
   result.reasoning.push(
-    `Checks: ${checksPassesd}/${totalChecks} passed | ${result.shouldTrade ? "✅ TRADE" : "❌ SKIP"}`,
+    `Checks: ${checksPassesd}/${totalChecks} | Signals: ${confirmingSignals} | ${result.shouldTrade ? "✅ TRADE" : "❌ SKIP"}`,
   )
 
   return result
 }
 
 /**
- * Scan all markets through the smart brain
- * Returns only markets that pass ALL checks
+ * Scan all markets through the smart brain + safe strategies
+ * Returns approved trades from both Smart Brain analysis AND safe strategies (snipes, arb)
  */
 export async function smartScan(bankroll = 1000) {
-  // Scan more markets — sweet spot is $10K-$100K, not top by volume
   const markets = await scanner.getTopMarkets(80)
   const approved = []
   let skipped = 0
 
+  // 1. Smart Brain evaluation on all markets
   for (const market of markets) {
     const eval_ = await evaluateMarket(market, bankroll)
 
@@ -350,8 +492,62 @@ export async function smartScan(bankroll = 1000) {
     }
   }
 
+  // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
+  try {
+    const snipes = await strategyEngine.findResolutionSnipes(0.93, 0.99)
+    for (const snipe of snipes.slice(0, 5)) {
+      // Don't duplicate if already approved by Smart Brain
+      if (approved.some(a => a.market?.id === snipe.market?.id)) continue
+      // Resolution snipes are safe — add directly with proper sizing
+      const betSize = Math.min(bankroll * 0.08, 40) // Up to 8% on safe snipes
+      approved.push({
+        market: snipe.market,
+        shouldTrade: true,
+        direction: "BUY_YES",
+        outcome: snipe.outcome,
+        confidence: 0.9,
+        estimatedProb: snipe.price + 0.02, // We expect it to resolve to 1.0
+        realEdge: (1 - snipe.price) - TOTAL_COST_PCT,
+        betSize,
+        reasoning: [snipe.reasoning, `Safe snipe: ${snipe.profit}% profit if resolves`],
+        score: parseFloat(snipe.profit) * 2, // Score snipes high — they're safe money
+        category: "snipe",
+        strategy: "Resolution Snipe",
+        checksDetail: { safeStrategy: true },
+      })
+    }
+  } catch (err) {
+    console.error("[BRAIN] Snipe scan failed:", err.message)
+  }
+
+  // 3. Arbitrage opportunities (risk-free)
+  try {
+    const arbs = await strategyEngine.findArbitrage()
+    for (const arb of arbs.slice(0, 3)) {
+      if (approved.some(a => a.market?.id === arb.market?.id)) continue
+      const betSize = Math.min(bankroll * 0.10, 50) // Up to 10% on arb — it's risk-free
+      approved.push({
+        market: arb.market,
+        shouldTrade: true,
+        direction: "ARBITRAGE",
+        outcome: "BOTH",
+        confidence: 0.95,
+        estimatedProb: 1.0,
+        realEdge: parseFloat(arb.profit) / 100,
+        betSize,
+        reasoning: [arb.reasoning],
+        score: parseFloat(arb.profit) * 3, // Score arb highest — guaranteed profit
+        category: "arbitrage",
+        strategy: "Arbitrage",
+        checksDetail: { safeStrategy: true },
+      })
+    }
+  } catch (err) {
+    console.error("[BRAIN] Arb scan failed:", err.message)
+  }
+
   console.log(
-    `[BRAIN] Scanned ${markets.length} markets: ${approved.length} approved, ${skipped} skipped`,
+    `[BRAIN] Scanned ${markets.length} markets: ${approved.length} approved (${approved.filter(a => a.strategy === "Smart Brain").length} brain + ${approved.filter(a => a.strategy === "Resolution Snipe").length} snipes + ${approved.filter(a => a.strategy === "Arbitrage").length} arb), ${skipped} skipped`,
   )
 
   return {
@@ -370,7 +566,7 @@ export function explainDecision(evaluation) {
   }
 
   return (
-    `✅ *${evaluation.direction}* (${(evaluation.confidence * 100).toFixed(0)}% confidence)\n` +
+    `✅ *${evaluation.direction}* (${(evaluation.confidence * 100).toFixed(0)}% confidence, est. ${(evaluation.estimatedProb * 100).toFixed(0)}% prob)\n` +
     evaluation.reasoning.map((r) => `  • ${r}`).join("\n") +
     `\n  💵 Suggested: $${evaluation.betSize.toFixed(2)}`
   )
@@ -383,6 +579,9 @@ export default {
   correctLongshotBias,
   isEfficientlyPriced,
   calculateRealEdge,
+  detectCategory,
+  TRADEABLE_CATEGORIES,
+  SNIPE_ONLY_CATEGORIES,
   MIN_EDGE_PCT,
   TOTAL_COST_PCT,
 }

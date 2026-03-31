@@ -4,7 +4,7 @@
  * Fetches markets, analyzes odds, finds mispricings.
  * Uses Gamma API for market data and news analysis for edge detection.
  */
-import axios from "axios"
+import api from "./api-client.mjs"
 
 const GAMMA_API = "https://gamma-api.polymarket.com"
 const CLOB_API = "https://clob.polymarket.com"
@@ -13,7 +13,7 @@ const CLOB_API = "https://clob.polymarket.com"
  * Fetch active markets sorted by volume
  */
 export async function getTopMarkets(limit = 20) {
-  const { data } = await axios.get(`${GAMMA_API}/markets`, {
+  const { data } = await api.get(`${GAMMA_API}/markets`, {
     params: { limit, active: true, closed: false, order: "volume24hr", ascending: false },
     timeout: 10000,
   })
@@ -24,7 +24,7 @@ export async function getTopMarkets(limit = 20) {
  * Fetch markets by category/tag
  */
 export async function getMarketsByTag(tag, limit = 20) {
-  const { data } = await axios.get(`${GAMMA_API}/markets`, {
+  const { data } = await api.get(`${GAMMA_API}/markets`, {
     params: { limit, active: true, closed: false, tag_id: tag, order: "volume24hr", ascending: false },
     timeout: 10000,
   })
@@ -35,7 +35,7 @@ export async function getMarketsByTag(tag, limit = 20) {
  * Search markets by keyword
  */
 export async function searchMarkets(query, limit = 10) {
-  const { data } = await axios.get(`${GAMMA_API}/markets`, {
+  const { data } = await api.get(`${GAMMA_API}/markets`, {
     params: { limit, active: true, closed: false, order: "volume24hr", ascending: false },
     timeout: 10000,
   })
@@ -50,11 +50,11 @@ export async function searchMarkets(query, limit = 10) {
  */
 export async function getMarket(idOrSlug) {
   try {
-    const { data } = await axios.get(`${GAMMA_API}/markets/${idOrSlug}`, { timeout: 10000 })
+    const { data } = await api.get(`${GAMMA_API}/markets/${idOrSlug}`, { timeout: 10000 })
     return parseMarket(data)
   } catch {
     // Try slug search
-    const { data } = await axios.get(`${GAMMA_API}/markets`, {
+    const { data } = await api.get(`${GAMMA_API}/markets`, {
       params: { slug: idOrSlug, limit: 1 },
       timeout: 10000,
     })
@@ -67,7 +67,7 @@ export async function getMarket(idOrSlug) {
  */
 export async function getOrderBook(tokenId) {
   try {
-    const { data } = await axios.get(`${CLOB_API}/book`, {
+    const { data } = await api.get(`${CLOB_API}/book`, {
       params: { token_id: tokenId },
       timeout: 10000,
     })

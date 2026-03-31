@@ -158,7 +158,7 @@ export function runClaude({
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
 
-    const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT_MS) || 300000
+    const CLAUDE_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT_MS) || 3600000 // 1 hour
     const skipPerms = process.env.CLAUDE_SKIP_PERMISSIONS !== "false"
 
     const args = [
@@ -182,10 +182,13 @@ export function runClaude({
       resuming: isResuming,
     })
 
-    // Use per-user API key if provided, otherwise fall back to system key
+    // Use per-user API key if provided, otherwise let CLI use its own auth (OAuth session)
     const procEnv = { ...process.env }
     if (apiKey) {
       procEnv.ANTHROPIC_API_KEY = apiKey
+    } else {
+      // No API key — remove any stale env key so CLI uses its local OAuth session
+      delete procEnv.ANTHROPIC_API_KEY
     }
 
     const proc = spawn("claude", args, {

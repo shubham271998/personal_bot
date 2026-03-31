@@ -11,7 +11,7 @@
  *   7. Whale wallet tracking — follow the smart money
  */
 import db from "../database.mjs"
-import axios from "axios"
+import api from "./api-client.mjs"
 
 // ── DB Tables ───────────────────────────────────────────────
 db.raw.exec(`
@@ -339,7 +339,7 @@ export function scoreInsiderSignals(trade) {
  */
 export async function detectWhaleActivity(tokenId) {
   try {
-    const { data: book } = await axios.get(`https://clob.polymarket.com/book`, {
+    const { data: book } = await api.get(`https://clob.polymarket.com/book`, {
       params: { token_id: tokenId },
       timeout: 5000,
     })

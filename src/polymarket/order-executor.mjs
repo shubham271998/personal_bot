@@ -11,7 +11,7 @@
  *   - Rate limit awareness (60 orders/min)
  */
 import { ethers } from "ethers"
-import axios from "axios"
+import api from "./api-client.mjs"
 import db from "../database.mjs"
 import { encryptSecure, decryptSecure } from "../security.mjs"
 
@@ -60,7 +60,7 @@ export async function getWalletBalance(privateKey) {
  * Get current order book for a token
  */
 export async function getOrderBook(tokenId) {
-  const { data } = await axios.get(`${CLOB_API}/book`, {
+  const { data } = await api.get(`${CLOB_API}/book`, {
     params: { token_id: tokenId },
     timeout: 5000,
   })
@@ -71,7 +71,7 @@ export async function getOrderBook(tokenId) {
  * Get midpoint price
  */
 export async function getMidpoint(tokenId) {
-  const { data } = await axios.get(`${CLOB_API}/midpoint`, {
+  const { data } = await api.get(`${CLOB_API}/midpoint`, {
     params: { token_id: tokenId },
     timeout: 5000,
   })
@@ -82,7 +82,7 @@ export async function getMidpoint(tokenId) {
  * Get price history for a token
  */
 export async function getPriceHistory(tokenId, interval = "1d", fidelity = 60) {
-  const { data } = await axios.get(`${CLOB_API}/prices-history`, {
+  const { data } = await api.get(`${CLOB_API}/prices-history`, {
     params: { market: tokenId, interval, fidelity },
     timeout: 10000,
   })
@@ -93,7 +93,7 @@ export async function getPriceHistory(tokenId, interval = "1d", fidelity = 60) {
  * Get tick size for a market
  */
 export async function getTickSize(tokenId) {
-  const { data } = await axios.get(`${CLOB_API}/tick-size`, {
+  const { data } = await api.get(`${CLOB_API}/tick-size`, {
     params: { token_id: tokenId },
     timeout: 5000,
   })
@@ -211,7 +211,7 @@ export async function placeLimitOrder(telegramId, { tokenId, price, size, side, 
     const signature = await wallet.signTypedData(domain, types, orderData)
 
     // Post to CLOB API
-    const { data: resp } = await axios.post(`${CLOB_API}/order`, {
+    const { data: resp } = await api.post(`${CLOB_API}/order`, {
       order: {
         salt: salt.toString(),
         maker: wallet.address,
@@ -276,7 +276,7 @@ export async function cancelOrder(telegramId, orderId) {
     const sig = await wallet.signTypedData(domain, types, value)
 
     // Derive API creds
-    const { data: creds } = await axios.get(`${CLOB_API}/derive-api-key`, {
+    const { data: creds } = await api.get(`${CLOB_API}/derive-api-key`, {
       headers: {
         POLY_ADDRESS: wallet.address,
         POLY_SIGNATURE: sig,
@@ -287,7 +287,7 @@ export async function cancelOrder(telegramId, orderId) {
     })
 
     // Cancel with API key
-    await axios.delete(`${CLOB_API}/order/${orderId}`, {
+    await api.del(`${CLOB_API}/order/${orderId}`, {
       headers: {
         POLY_ADDRESS: wallet.address,
         POLY_API_KEY: creds.apiKey,

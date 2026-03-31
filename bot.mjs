@@ -71,15 +71,16 @@ import autoAnalyst from "./src/polymarket/auto-analyst.mjs"
 import selfImprover from "./src/polymarket/self-improver.mjs"
 import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
 import smartBrain from "./src/polymarket/smart-brain.mjs"
+import pmApiClient from "./src/polymarket/api-client.mjs"
 import cloudDb from "./src/cloud-db.mjs"
 import db from "./src/database.mjs"
 
 // ── Config ──────────────────────────────────────────────────
-// BOT_ROLE: "trading" = prediction markets only (cloud), "coding" = Claude + system (local)
-const BOT_ROLE = process.env.BOT_ROLE || (process.platform === "darwin" ? "coding" : "trading")
-const IS_TRADING_BOT = BOT_ROLE === "trading"
-const IS_CODING_BOT = BOT_ROLE === "coding"
-const BOT_MODE = IS_CODING_BOT ? "🏠 Local" : "☁️ Cloud"
+// BOT_ROLE: "both" = coding + trading (local), "trading" = PM only (cloud), "coding" = Claude only
+const BOT_ROLE = process.env.BOT_ROLE || (process.platform === "darwin" ? "both" : "trading")
+const IS_TRADING_BOT = BOT_ROLE === "trading" || BOT_ROLE === "both"
+const IS_CODING_BOT = BOT_ROLE === "coding" || BOT_ROLE === "both"
+const BOT_MODE = BOT_ROLE === "both" ? "🏠 Local (Full)" : IS_CODING_BOT ? "🏠 Local" : "☁️ Cloud"
 const BOT_TAG = IS_CODING_BOT ? "🏠" : "☁️"
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!BOT_TOKEN) {
@@ -221,9 +222,11 @@ for (const id of ALLOWED_USER_IDS) {
 function isAllowed(userId) {
   // Admins from ALLOWED_TELEGRAM_IDS always allowed
   if (ALLOWED_USER_IDS.includes(userId)) return true
+  // Local mode (macOS): admins don't need API key — CLI uses local OAuth session
+  if (IS_CODING_BOT && ALLOWED_USER_IDS.includes(userId)) return true
   // Registered + approved users with API key are allowed
   const user = userManager.get(userId)
-  return user?.isApproved && userManager.hasApiKey(userId)
+  return user?.isApproved && (userManager.hasApiKey(userId) || IS_CODING_BOT)
 }
 
 function isAdmin(userId) {
@@ -260,6 +263,11 @@ if (ownerChatId && IS_TRADING_BOT) {
 
   setTimeout(async () => {
     try {
+      // Warm up DNS cache for Polymarket domains (handles geo-blocking via DOH fallback)
+      await pmApiClient.warmup()
+      const health = await pmApiClient.healthCheck()
+      console.log(`[PM] API health: ${health.ok ? "✅ connected" : "❌ " + health.error}`)
+
       liveMonitor.start(1000)
       autoAnalyst.startAutonomous()
       console.log("[PM] Auto-started: monitor + analyst + virtual trading ($1000 bankroll)")
@@ -618,7 +626,9 @@ bot.onText(/\/start/, (msg) => {
   const hasKey = userManager.hasApiKey(userId)
   const statusLine = hasKey
     ? `✅ You're all set up!`
-    : `👋 Use /setup to connect your account and get started`
+    : IS_CODING_BOT
+      ? `✅ Running locally — using CLI auth (no API key needed)`
+      : `👋 Use /setup to connect your account and get started`
 
   if (IS_TRADING_BOT) {
     bot.sendMessage(
@@ -1867,7 +1877,9 @@ bot.on("message", async (msg) => {
 
   if (!isAllowed(msg.from.id)) {
     const guestName = msg.from.first_name || "there"
-    bot.sendMessage(chatId, `Hey ${guestName}! 👋 Use /setup to connect your account and we can get started.`)
+    bot.sendMessage(chatId, IS_CODING_BOT
+      ? `Hey ${guestName}! 👋 Ask an admin to approve you with /approve`
+      : `Hey ${guestName}! 👋 Use /setup to connect your account and we can get started.`)
     logger.security("Unauthorized access attempt", {
       userId: msg.from.id,
       username: msg.from.username,
@@ -1925,9 +1937,9 @@ async function handleClaudeQuery(chatId, prompt, msg = null) {
   const projectName = getProjectName(chatId)
   const startTime = Date.now()
 
-  // Get user's API key (admins can use system key)
+  // Get user's API key — in local mode, CLI uses its own OAuth session (no key needed)
   const userApiKey = userManager.getApiKey(userId)
-  if (!userApiKey && !isAdmin(userId)) {
+  if (!userApiKey && !isAdmin(userId) && !IS_CODING_BOT) {
     bot.sendMessage(chatId, "You'll need to connect your account first! Hit /setup and I'll walk you through it 🔑")
     return
   }
