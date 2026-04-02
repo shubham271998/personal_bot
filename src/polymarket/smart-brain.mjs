@@ -190,6 +190,10 @@ export async function evaluateMarket(market, bankroll = 1000) {
   const noPrice = market.outcomes[1]?.price || 1 - yesPrice
   const question = market.question || ""
 
+  // Pre-compute market context flags used throughout evaluation
+  const isNegativeOutcome = /\bceasefire\b|peace\b|end\s+(of\s+)?(war|conflict|military)|fall\b|leave\b|resign|step\s+down|out\s+by/i.test(question)
+  const isStatusQuoUnlikely = yesPrice < 0.25 // Market already thinks it's unlikely
+
   // ── Check 0: Category — do I understand this market? ──────
   const category = detectCategory(question)
   result.category = category
@@ -350,8 +354,6 @@ export async function evaluateMarket(market, bankroll = 1000) {
   // RULE 2: Understand WHAT the market is asking.
   // "Will Iran ceasefire happen?" + news about "Iran conflict/war/attack" = ceasefire LESS likely
   // The agent was confusing "news exists about topic" with "YES is more likely"
-  const isNegativeOutcome = /\bceasefire\b|peace\b|end\s+(of\s+)?(war|conflict|military)|fall\b|leave\b|resign|step\s+down|out\s+by/i.test(question)
-  const isStatusQuoUnlikely = yesPrice < 0.25 // Market already thinks it's unlikely
 
   // Adjust based on news — but UNDERSTAND the direction
   if (newsSentiment && newsSignalStrength !== 0) {
