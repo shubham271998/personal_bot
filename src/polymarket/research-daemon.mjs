@@ -26,9 +26,9 @@ const DB_DIR = process.env.DB_DIR || path.resolve(__dirname, "../../data")
 const DB_PATH = path.join(DB_DIR, "bot.db")
 
 // ── Config ─────────────────────────────────────────────────
-const RESEARCH_INTERVAL_MS = 30 * 60 * 1000 // Research cycle every 30 min
-const MAX_MARKETS_PER_CYCLE = 15 // Analyze top 15 interesting markets
-const RESEARCH_TTL_HOURS = 6 // Research is stale after 6 hours
+const RESEARCH_INTERVAL_MS = 5 * 60 * 1000 // Research cycle every 5 min — speed matters
+const MAX_MARKETS_PER_CYCLE = 8 // Analyze 8 markets per cycle (faster cycles, fewer per batch)
+const RESEARCH_TTL_HOURS = 3 // Research is stale after 3 hours (markets move fast)
 const CLAUDE_TIMEOUT_MS = 60000 // 60s per market analysis
 
 // ── DB Setup ───────────────────────────────────────────────

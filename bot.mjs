@@ -72,6 +72,7 @@ import selfImprover from "./src/polymarket/self-improver.mjs"
 import adaptiveLearner from "./src/polymarket/adaptive-learner.mjs"
 import smartBrain from "./src/polymarket/smart-brain.mjs"
 import pmApiClient from "./src/polymarket/api-client.mjs"
+import priceMonitor from "./src/polymarket/price-monitor.mjs"
 import cloudDb from "./src/cloud-db.mjs"
 import db from "./src/database.mjs"
 
@@ -270,7 +271,8 @@ if (ownerChatId && IS_TRADING_BOT) {
 
       liveMonitor.start(1000)
       autoAnalyst.startAutonomous()
-      console.log("[PM] Auto-started: monitor + analyst + virtual trading ($1000 bankroll)")
+      priceMonitor.connect() // Real-time BTC/ETH/SOL from Binance
+      console.log("[PM] Auto-started: monitor + analyst + virtual trading + price feed ($1000 bankroll)")
       bot.sendMessage(ownerChatId,
         `☁️ *Trading Bot Online*\n\n` +
           `Auto-started with $1000 virtual bankroll.\n` +

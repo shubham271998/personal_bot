@@ -930,16 +930,17 @@ export function startAutonomous() {
   // Briefing every 4 hours (was 2h — too frequent, same data)
   _briefingInterval = setInterval(() => sendBriefing(), 4 * 60 * 60 * 1000)
 
-  // Virtual trade cycle every 15 minutes (was 5m — too frequent, spams on every close/open)
-  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 15 * 60 * 1000)
-  setTimeout(() => runVirtualTradingCycle(), 3 * 60 * 1000) // First run after 3 min
+  // Virtual trade cycle every 2 minutes — fast position checking + trading
+  // Scans are cached, so this is cheap. Speed = opportunity.
+  _virtualTradeInterval = setInterval(() => runVirtualTradingCycle(), 2 * 60 * 1000)
+  setTimeout(() => runVirtualTradingCycle(), 45000) // First run after 45s
 
-  // Evaluate predictions every 1 hour (was 30m — evaluations rarely change faster)
-  _evalInterval = setInterval(() => runEvaluation(), 60 * 60 * 1000)
+  // Evaluate predictions every 15 minutes — catch resolved markets fast
+  _evalInterval = setInterval(() => runEvaluation(), 15 * 60 * 1000)
 
-  // Auto-manage watchlist every 2 hours (was 15m — the biggest spam source, silently manage)
-  _watchlistInterval = setInterval(() => runWatchlistUpdate(), 2 * 60 * 60 * 1000)
-  setTimeout(() => runWatchlistUpdate(), 60000) // First run after 1 min (silent)
+  // Auto-manage watchlist every 1 hour (silent)
+  _watchlistInterval = setInterval(() => runWatchlistUpdate(), 60 * 60 * 1000)
+  setTimeout(() => runWatchlistUpdate(), 30000)
 
   // Daily scorecard every 12 hours (was 6h — twice a day is enough)
   _scorecardInterval = setInterval(() => sendScorecard(), 12 * 60 * 60 * 1000)

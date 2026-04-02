@@ -481,16 +481,30 @@ export async function evaluateMarket(market, bankroll = 1000) {
   const checksPassesd = Object.values(result.checks).filter(Boolean).length
   const totalChecks = Object.keys(result.checks).length
 
-  // Unified thresholds — no more "learning mode" that lets garbage through
-  // Virtual or live, we need REAL edge to trade
-  const minChecks = 4 // At least 4/9 checks (was 3/7 — too loose)
+  // RELIABILITY FIRST: user funds can't be lost. Be strict.
+  const minChecks = 5 // At least 5/10 checks (tightened from 4)
   const minEdge = 0.03 // 3% minimum edge after costs
   const minSignals = 2 // Need 2+ confirming signals
 
-  result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
+  // CRITICAL: if Claude AI analyzed this and said "FAIR" → don't trade
+  // Claude saying "FAIR" means no edge. Trust it.
+  const claudeSaidFair = usedClaude && result.reasoning.some(r => r.includes("fairly priced") || r.includes("FAIR"))
+  if (claudeSaidFair) {
+    result.reasoning.push("Claude AI says FAIR — no edge, skipping")
+  }
 
-  // NO more "learning override" — learning comes from predictions, not from losing money
-  // Instead: record ALL evaluations as predictions for Brier scoring regardless of trade
+  result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals && !claudeSaidFair
+
+  // EXTRA SAFETY: Smart Brain must have Claude confirmation for any trade
+  // Without Claude research, Smart Brain is just keyword matching — unreliable
+  if (result.shouldTrade && !usedClaude && !result.checks.researchCheck) {
+    // No AI backing — reduce to minimum bet and require extra signal
+    if (confirmingSignals < 3) {
+      result.shouldTrade = false
+      result.reasoning.push("No AI research backing — need 3+ signals without Claude")
+    }
+  }
+
   result.confidence = checksPassesd / totalChecks
   result.checksDetail = { ...result.checks }
   result.researchSummary = research ? {
@@ -502,8 +516,19 @@ export async function evaluateMarket(market, bankroll = 1000) {
   result.score = realEdge * 100 * result.confidence * (TRADEABLE_CATEGORIES.has(category) ? 1.2 : 0.8)
 
   if (result.shouldTrade) {
-    // Determine direction
-    if (estimatedProb > yesPrice + TOTAL_COST_PCT) {
+    // Determine direction — PREFER NO SIDE on geopolitical/unlikely events
+    // Data: all Smart Brain losses were from buying YES on "will X happen?" markets
+    if (category === "geopolitical" && isStatusQuoUnlikely) {
+      // Geopolitical + unlikely = ONLY buy NO (bet against dramatic events)
+      if (estimatedProb < yesPrice - TOTAL_COST_PCT) {
+        result.direction = "BUY_NO"
+        result.outcome = market.outcomes[1]?.name || "No"
+        result.reasoning.push("Geopolitical: betting NO (status quo wins)")
+      } else {
+        result.shouldTrade = false
+        result.reasoning.push("Geopolitical: won't buy YES on unlikely events — every time we did, we lost")
+      }
+    } else if (estimatedProb > yesPrice + TOTAL_COST_PCT) {
       result.direction = "BUY_YES"
       result.outcome = market.outcomes[0].name
     } else if (estimatedProb < yesPrice - TOTAL_COST_PCT) {
