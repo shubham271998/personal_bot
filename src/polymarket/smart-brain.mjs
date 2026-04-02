@@ -19,6 +19,7 @@ import selfImprover from "./self-improver.mjs"
 import adaptiveLearner from "./adaptive-learner.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import researcher from "./web-researcher.mjs"
+import analyst from "./market-analyst.mjs"
 
 // ── Constants from research ─────────────────────────────────
 
@@ -333,93 +334,108 @@ export async function evaluateMarket(market, bankroll = 1000) {
   }
 
   // ── Run research ONLY if cheap checks look promising ────────
-  // (saves API calls — only ~5-10 markets out of 80 reach here)
   const cheapChecksPassed = [result.checks.categoryCheck, result.checks.priceRangeCheck,
     result.checks.efficiencyCheck, result.checks.biasCheck, result.checks.historyCheck].filter(Boolean).length
   if (cheapChecksPassed >= 3) {
     try {
       research = await researcher.researchMarket(market, category)
-      result.reasoning.push(`Researched: ${research?.sources?.length || 0} sources, ${research?.signals?.length || 0} signals`)
     } catch {}
   }
 
   // ── Build probability estimate ────────────────────────────
-  // RULE 1: The market is smarter than us. It has thousands of traders.
-  // Our job is to find SMALL edges, not override the market by 20%.
-  // Max total adjustment from ALL signals combined: ±5% from market price.
+  // PRIORITY: If Claude AI analysis is available, use it as PRIMARY signal.
+  // Claude can actually READ headlines and UNDERSTAND context — keyword matching can't.
   let estimatedProb = yesPrice
-  let totalAdjustment = 0
-  const MAX_TOTAL_ADJUSTMENT = 0.05 // Never deviate more than 5% from market
+  let usedClaude = false
 
-  // RULE 2: Understand WHAT the market is asking.
-  // "Will Iran ceasefire happen?" + news about "Iran conflict/war/attack" = ceasefire LESS likely
-  // The agent was confusing "news exists about topic" with "YES is more likely"
+  if (analyst.isAvailable() && cheapChecksPassed >= 3) {
+    try {
+      // Gather context for Claude
+      const headlines = []
+      try {
+        const news = await newsAnalyzer.searchNews(question.slice(0, 40), 6)
+        headlines.push(...news)
+      } catch {}
 
-  // Adjust based on news — but UNDERSTAND the direction
-  if (newsSentiment && newsSignalStrength !== 0) {
-    let newsImpact = newsSignalStrength * 0.03 // Max ±3% from news (was ±8% — way too much)
+      const context = {}
+      if (research?.cryptoContext) context.crypto = research.cryptoContext
+      if (research?.sportsContext) context.sports = research.sportsContext
+      if (research?.priceHistory) context.priceHistory = research.priceHistory
 
-    // Critical: if market asks "will ceasefire/peace happen?" and news is about conflict/war,
-    // that makes ceasefire LESS likely, not more
-    if (isNegativeOutcome && newsSentiment.sentiment === "bullish") {
-      // "Bullish" news about a conflict topic = status quo continues = ceasefire unlikely
-      newsImpact = -Math.abs(newsImpact) * 0.5 // Flip and reduce
-      result.reasoning.push(`News about conflict → ceasefire LESS likely (flipped signal)`)
-    }
+      const analysis = await analyst.analyzeMarket(market, headlines, context)
+      if (analysis) {
+        usedClaude = true
+        result.checks.researchCheck = true
 
-    totalAdjustment += newsImpact
-    result.reasoning.push(`News: ${newsImpact > 0 ? "+" : ""}${(newsImpact * 100).toFixed(1)}%`)
-  }
+        // Claude's probability is the BEST estimate we have
+        // But still blend with market: 40% Claude, 60% market (market has more info)
+        const claudeProb = analysis.probability
+        const blendWeight = analysis.confidence === "high" ? 0.5 : analysis.confidence === "medium" ? 0.35 : 0.2
+        estimatedProb = claudeProb * blendWeight + yesPrice * (1 - blendWeight)
 
-  // Adjust based on whale activity (smaller impact)
-  if (whaleSignal !== 0) {
-    const cappedWhale = Math.sign(whaleSignal) * Math.min(Math.abs(whaleSignal), 0.02) // Max ±2%
-    totalAdjustment += cappedWhale
-  }
+        result.reasoning.push(`🧠 Claude: ${(claudeProb * 100).toFixed(0)}% (${analysis.confidence}) — ${analysis.reasoning}`)
+        result.reasoning.push(`Blend: ${(blendWeight * 100).toFixed(0)}% Claude + ${((1 - blendWeight) * 100).toFixed(0)}% market → ${(estimatedProb * 100).toFixed(1)}%`)
 
-  // Adjust based on RESEARCH signals
-  if (research?.signals?.length > 0) {
-    result.checks.researchCheck = true
-    let researchAdjustment = 0
-
-    for (const sig of research.signals) {
-      let impact = sig.direction === "bullish" ? sig.strength * 0.02 : -sig.strength * 0.02 // Max ±2% per signal
-
-      // Same flip logic for research: conflict news on peace markets
-      if (isNegativeOutcome && sig.source !== "odds_comparison" && sig.direction === "bullish") {
-        impact = -Math.abs(impact) * 0.5
+        if (analysis.direction === "FAIR") {
+          result.reasoning.push("Claude says market is fairly priced — no edge")
+        }
       }
-
-      researchAdjustment += impact
-      result.reasoning.push(`${sig.source}: ${sig.detail}`)
+    } catch (err) {
+      console.error(`[BRAIN] Claude analysis failed: ${err.message}`)
     }
-
-    // Cap research adjustment
-    researchAdjustment = Math.max(-0.03, Math.min(0.03, researchAdjustment))
-    totalAdjustment += researchAdjustment
-
-    // Sportsbook odds — the ONE case where we trust external data over market
-    const oddsSignal = research.signals.find(s => s.source === "odds_comparison")
-    if (oddsSignal && research.sportsbookOdds) {
-      const bookProb = research.sportsbookOdds.impliedProbability
-      estimatedProb = bookProb * 0.6 + yesPrice * 0.4
-      totalAdjustment = 0 // Sportsbook overrides all other adjustments
-      result.reasoning.push(`Sportsbook: ${(bookProb * 100).toFixed(0)}% (overrides other signals)`)
-    }
-  } else {
-    result.checks.researchCheck = false
   }
 
-  // RULE 3: Status quo bias for unlikely events
-  // If market says <25% and we have no STRONG contradicting evidence, trust the market
-  if (isStatusQuoUnlikely && totalAdjustment > 0) {
-    totalAdjustment *= 0.3 // Reduce bullish adjustments on already-unlikely events
-    result.reasoning.push(`Status quo bias: market says unlikely, reducing bullish adjustment`)
-  }
+  // Fallback: if Claude unavailable, use signal-based estimation (capped ±5%)
+  if (!usedClaude) {
+    let totalAdjustment = 0
+    const MAX_TOTAL_ADJUSTMENT = 0.05
 
-  // Apply capped adjustment
-  totalAdjustment = Math.max(-MAX_TOTAL_ADJUSTMENT, Math.min(MAX_TOTAL_ADJUSTMENT, totalAdjustment))
-  estimatedProb += totalAdjustment
+    // News signal (capped, direction-aware)
+    if (newsSentiment && newsSignalStrength !== 0) {
+      let newsImpact = newsSignalStrength * 0.03
+      if (isNegativeOutcome && newsSentiment.sentiment === "bullish") {
+        newsImpact = -Math.abs(newsImpact) * 0.5
+      }
+      totalAdjustment += newsImpact
+    }
+
+    // Whale signal (capped)
+    if (whaleSignal !== 0) {
+      totalAdjustment += Math.sign(whaleSignal) * Math.min(Math.abs(whaleSignal), 0.02)
+    }
+
+    // Research signals
+    if (research?.signals?.length > 0) {
+      result.checks.researchCheck = true
+      let researchAdj = 0
+      for (const sig of research.signals) {
+        let impact = sig.direction === "bullish" ? sig.strength * 0.02 : -sig.strength * 0.02
+        if (isNegativeOutcome && sig.source !== "odds_comparison" && sig.direction === "bullish") {
+          impact = -Math.abs(impact) * 0.5
+        }
+        researchAdj += impact
+        result.reasoning.push(`${sig.source}: ${sig.detail}`)
+      }
+      totalAdjustment += Math.max(-0.03, Math.min(0.03, researchAdj))
+
+      // Sportsbook odds override
+      const oddsSignal = research.signals.find(s => s.source === "odds_comparison")
+      if (oddsSignal && research.sportsbookOdds) {
+        estimatedProb = research.sportsbookOdds.impliedProbability * 0.6 + yesPrice * 0.4
+        totalAdjustment = 0
+        result.reasoning.push(`Sportsbook: ${(research.sportsbookOdds.impliedProbability * 100).toFixed(0)}%`)
+      }
+    }
+
+    // Status quo bias
+    if (isStatusQuoUnlikely && totalAdjustment > 0) {
+      totalAdjustment *= 0.3
+    }
+
+    totalAdjustment = Math.max(-MAX_TOTAL_ADJUSTMENT, Math.min(MAX_TOTAL_ADJUSTMENT, totalAdjustment))
+    estimatedProb += totalAdjustment
+    result.reasoning.push(`Signal-based (no AI): mkt ${(yesPrice * 100).toFixed(1)}% ${totalAdjustment >= 0 ? "+" : ""}${(totalAdjustment * 100).toFixed(1)}%`)
+  }
 
   // Near-resolution momentum
   if (yesPrice > 0.90) {
@@ -429,10 +445,6 @@ export async function evaluateMarket(market, bankroll = 1000) {
   // Clamp
   estimatedProb = Math.max(0.02, Math.min(0.98, estimatedProb))
   result.estimatedProb = estimatedProb
-
-  if (Math.abs(totalAdjustment) > 0.001) {
-    result.reasoning.push(`Final estimate: ${(estimatedProb * 100).toFixed(1)}% (market ${(yesPrice * 100).toFixed(1)}% ${totalAdjustment >= 0 ? "+" : ""}${(totalAdjustment * 100).toFixed(1)}%)`)
-  }
 
   // ── Calculate real edge ───────────────────────────────────
   const realEdge = calculateRealEdge(estimatedProb, yesPrice, market)
