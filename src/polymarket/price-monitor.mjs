@@ -50,12 +50,20 @@ export function connect() {
 
       ws.on("close", () => {
         isConnected = false
-        console.log("[PRICE-MONITOR] Disconnected, reconnecting in 10s...")
-        setTimeout(connect, 10000)
+        // Don't reconnect — fall back to polling
+        console.log("[PRICE-MONITOR] WebSocket closed, switching to polling fallback")
+        startPollingFallback()
       })
 
       ws.on("error", (err) => {
-        console.error("[PRICE-MONITOR] Error:", err.message)
+        // 451 = geo-blocked (Binance blocked on Railway Singapore)
+        // Don't spam reconnect, just use polling
+        if (err.message?.includes("451") || err.message?.includes("Unexpected server response")) {
+          console.log("[PRICE-MONITOR] Binance WS geo-blocked, using polling")
+          if (ws) { ws.removeAllListeners(); ws.close(); ws = null }
+          isConnected = false
+          startPollingFallback()
+        }
       })
     }).catch(() => {
       console.log("[PRICE-MONITOR] WebSocket module not available — using polling fallback")
@@ -110,7 +118,10 @@ function handleTicker(msg) {
 }
 
 // Polling fallback if WebSocket not available
+let pollingStarted = false
 function startPollingFallback() {
+  if (pollingStarted) return
+  pollingStarted = true
   import("axios").then(({ default: axios }) => {
     setInterval(async () => {
       try {
