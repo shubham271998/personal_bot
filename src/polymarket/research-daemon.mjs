@@ -154,7 +154,7 @@ function askClaude(prompt) {
 
 // ── Market analysis ────────────────────────────────────────
 
-async function analyzeMarket(market, headlines, redditPosts = []) {
+async function analyzeMarket(market, headlines, redditPosts = [], expertSummary = "") {
   const question = market.question || ""
   const yesPrice = market.outcomes?.[0]?.price || 0.5
 
@@ -166,12 +166,15 @@ async function analyzeMarket(market, headlines, redditPosts = []) {
     ? "\n\nReddit discussion:\n" + redditPosts.map(p => `- r/${p.subreddit}: "${p.title}" (${p.score} upvotes, ${p.comments} comments)`).join("\n")
     : ""
 
+  // Expert intel: YouTube analysis transcripts + expert Twitter opinions
+  const expertText = expertSummary ? `\n${expertSummary}` : ""
+
   const prompt = `You are an expert prediction market analyst and trader. Analyze this Polymarket question deeply.
 
 MARKET: "${question}"
 Current market price (YES): ${(yesPrice * 100).toFixed(1)}%
 24h Volume: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
-${headlineText}${redditText}
+${headlineText}${redditText}${expertText}
 
 Think step by step:
 1. What is this market actually asking? What outcome counts as YES?
@@ -254,20 +257,32 @@ async function runResearchCycle() {
   for (const market of interesting) {
     const category = brain.detectCategory(market.question)
 
-    // Get headlines + Reddit posts
+    // Gather ALL intelligence: headlines, Reddit, YouTube, expert tweets
     let headlines = []
     let redditPosts = []
+    let expertSummary = ""
     try {
       const news = await newsAnalyzer.searchNews(market.question.slice(0, 40), 5)
       headlines = news.map(h => h.title).filter(Boolean)
     } catch {}
     try {
-      const researcher = await import("./web-researcher.mjs")
-      redditPosts = await researcher.searchReddit(market.question.slice(0, 40), 3)
+      const researcherMod = await import("./web-researcher.mjs")
+      redditPosts = await researcherMod.searchReddit(market.question.slice(0, 40), 3)
     } catch {}
+    // Expert intelligence: YouTube transcripts + expert tweets (for high-value markets only)
+    if (market.volume24hr > 50000) {
+      try {
+        const expertIntel = await import("./expert-intel.mjs")
+        const intel = await expertIntel.gatherExpertIntel(market.question, category)
+        expertSummary = intel.summary || ""
+        if (intel.sources > 0) {
+          console.log(`[RESEARCH] Expert intel: ${intel.youtube.length} YT + ${intel.expertTweets.length} tweets for "${market.question.slice(0, 30)}"`)
+        }
+      } catch {}
+    }
 
-    // Ask Claude CLI with headlines + Reddit context
-    const analysis = await analyzeMarket(market, headlines, redditPosts)
+    // Ask Claude CLI with ALL context
+    const analysis = await analyzeMarket(market, headlines, redditPosts, expertSummary)
     if (!analysis) continue
 
     // Store in local DB
