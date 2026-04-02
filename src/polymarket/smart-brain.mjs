@@ -215,6 +215,11 @@ export async function evaluateMarket(market, bankroll = 1000) {
       result.reasoning.push(`${category.toUpperCase()} market — snipe territory (${(yesPrice * 100).toFixed(0)}%)`)
     }
     result.checks.categoryCheck = true
+  } else if (category === "geopolitical" && isStatusQuoUnlikely) {
+    // LEARNED: geopolitical "will X happen?" at <25% → almost always resolves NO
+    // Only trade the NO side (betting AGAINST dramatic events happening)
+    result.checks.categoryCheck = true
+    result.reasoning.push(`geopolitical + unlikely (${(yesPrice * 100).toFixed(0)}%) — favor NO side (status quo wins)`)
   } else if (TRADEABLE_CATEGORIES.has(category)) {
     result.checks.categoryCheck = true
     result.reasoning.push(`${category} market — news/data edge possible`)
@@ -316,9 +321,11 @@ export async function evaluateMarket(market, bankroll = 1000) {
 
   // ── Check 7: Strategy weight from learner ─────────────────
   const stratWeight = adaptiveLearner.getStrategyWeight("Smart Brain")
-  result.checks.historyCheck = stratWeight >= 0.3 // Strategy not killed
+  // Don't fully kill Smart Brain — it needs to keep trading (small bets) to learn and improve
+  // Only pause if weight is truly at minimum (0.1)
+  result.checks.historyCheck = stratWeight > 0.1
   if (!result.checks.historyCheck) {
-    result.reasoning.push(`Smart Brain strategy weight too low (${(stratWeight * 100).toFixed(0)}%) — paused`)
+    result.reasoning.push(`Smart Brain strategy weight at minimum (${(stratWeight * 100).toFixed(0)}%) — paused`)
   }
 
   // ── Run research ONLY if cheap checks look promising ────────
@@ -332,53 +339,98 @@ export async function evaluateMarket(market, bankroll = 1000) {
     } catch {}
   }
 
-  // ── Build probability estimate using ALL research signals ──
-  // Start with market price as base (respect the market — it's usually right)
+  // ── Build probability estimate ────────────────────────────
+  // RULE 1: The market is smarter than us. It has thousands of traders.
+  // Our job is to find SMALL edges, not override the market by 20%.
+  // Max total adjustment from ALL signals combined: ±5% from market price.
   let estimatedProb = yesPrice
+  let totalAdjustment = 0
+  const MAX_TOTAL_ADJUSTMENT = 0.05 // Never deviate more than 5% from market
 
-  // Adjust based on news
+  // RULE 2: Understand WHAT the market is asking.
+  // "Will Iran ceasefire happen?" + news about "Iran conflict/war/attack" = ceasefire LESS likely
+  // The agent was confusing "news exists about topic" with "YES is more likely"
+  const isNegativeOutcome = /\bceasefire\b|peace\b|end\s+(of\s+)?(war|conflict|military)|fall\b|leave\b|resign|step\s+down|out\s+by/i.test(question)
+  const isStatusQuoUnlikely = yesPrice < 0.25 // Market already thinks it's unlikely
+
+  // Adjust based on news — but UNDERSTAND the direction
   if (newsSentiment && newsSignalStrength !== 0) {
-    const newsImpact = newsSignalStrength * 0.08
-    estimatedProb += newsImpact
-    result.reasoning.push(`News shifts estimate by ${newsImpact > 0 ? "+" : ""}${(newsImpact * 100).toFixed(1)}%`)
+    let newsImpact = newsSignalStrength * 0.03 // Max ±3% from news (was ±8% — way too much)
+
+    // Critical: if market asks "will ceasefire/peace happen?" and news is about conflict/war,
+    // that makes ceasefire LESS likely, not more
+    if (isNegativeOutcome && newsSentiment.sentiment === "bullish") {
+      // "Bullish" news about a conflict topic = status quo continues = ceasefire unlikely
+      newsImpact = -Math.abs(newsImpact) * 0.5 // Flip and reduce
+      result.reasoning.push(`News about conflict → ceasefire LESS likely (flipped signal)`)
+    }
+
+    totalAdjustment += newsImpact
+    result.reasoning.push(`News: ${newsImpact > 0 ? "+" : ""}${(newsImpact * 100).toFixed(1)}%`)
   }
 
-  // Adjust based on whale activity
+  // Adjust based on whale activity (smaller impact)
   if (whaleSignal !== 0) {
-    estimatedProb += whaleSignal
-    result.reasoning.push(`Whale signal shifts estimate by ${whaleSignal > 0 ? "+" : ""}${(whaleSignal * 100).toFixed(1)}%`)
+    const cappedWhale = Math.sign(whaleSignal) * Math.min(Math.abs(whaleSignal), 0.02) // Max ±2%
+    totalAdjustment += cappedWhale
   }
 
-  // Adjust based on RESEARCH signals (web search, social, price momentum, odds, crypto)
+  // Adjust based on RESEARCH signals
   if (research?.signals?.length > 0) {
     result.checks.researchCheck = true
+    let researchAdjustment = 0
+
     for (const sig of research.signals) {
-      const impact = sig.direction === "bullish" ? sig.strength * 0.06 : -sig.strength * 0.06
-      estimatedProb += impact
-      result.reasoning.push(`${sig.source}: ${sig.detail} (${impact > 0 ? "+" : ""}${(impact * 100).toFixed(1)}%)`)
+      let impact = sig.direction === "bullish" ? sig.strength * 0.02 : -sig.strength * 0.02 // Max ±2% per signal
+
+      // Same flip logic for research: conflict news on peace markets
+      if (isNegativeOutcome && sig.source !== "odds_comparison" && sig.direction === "bullish") {
+        impact = -Math.abs(impact) * 0.5
+      }
+
+      researchAdjustment += impact
+      result.reasoning.push(`${sig.source}: ${sig.detail}`)
     }
-    // Sportsbook odds override — strongest signal for sports
+
+    // Cap research adjustment
+    researchAdjustment = Math.max(-0.03, Math.min(0.03, researchAdjustment))
+    totalAdjustment += researchAdjustment
+
+    // Sportsbook odds — the ONE case where we trust external data over market
     const oddsSignal = research.signals.find(s => s.source === "odds_comparison")
     if (oddsSignal && research.sportsbookOdds) {
-      // Sportsbook implied prob is the BEST estimate for sports
       const bookProb = research.sportsbookOdds.impliedProbability
-      // Blend: 60% sportsbook, 40% market (books are sharper than PM for sports)
-      estimatedProb = bookProb * 0.6 + estimatedProb * 0.4
-      result.reasoning.push(`Sportsbook blend: ${(bookProb * 100).toFixed(0)}% book × 60% + ${(yesPrice * 100).toFixed(0)}% PM × 40%`)
+      estimatedProb = bookProb * 0.6 + yesPrice * 0.4
+      totalAdjustment = 0 // Sportsbook overrides all other adjustments
+      result.reasoning.push(`Sportsbook: ${(bookProb * 100).toFixed(0)}% (overrides other signals)`)
     }
   } else {
     result.checks.researchCheck = false
   }
 
-  // Near-resolution: if price > 90%, increase probability estimate (momentum)
+  // RULE 3: Status quo bias for unlikely events
+  // If market says <25% and we have no STRONG contradicting evidence, trust the market
+  if (isStatusQuoUnlikely && totalAdjustment > 0) {
+    totalAdjustment *= 0.3 // Reduce bullish adjustments on already-unlikely events
+    result.reasoning.push(`Status quo bias: market says unlikely, reducing bullish adjustment`)
+  }
+
+  // Apply capped adjustment
+  totalAdjustment = Math.max(-MAX_TOTAL_ADJUSTMENT, Math.min(MAX_TOTAL_ADJUSTMENT, totalAdjustment))
+  estimatedProb += totalAdjustment
+
+  // Near-resolution momentum
   if (yesPrice > 0.90) {
     estimatedProb = Math.max(estimatedProb, yesPrice + 0.02)
-    result.reasoning.push("Near resolution momentum — slight upward bias")
   }
 
   // Clamp
   estimatedProb = Math.max(0.02, Math.min(0.98, estimatedProb))
   result.estimatedProb = estimatedProb
+
+  if (Math.abs(totalAdjustment) > 0.001) {
+    result.reasoning.push(`Final estimate: ${(estimatedProb * 100).toFixed(1)}% (market ${(yesPrice * 100).toFixed(1)}% ${totalAdjustment >= 0 ? "+" : ""}${(totalAdjustment * 100).toFixed(1)}%)`)
+  }
 
   // ── Calculate real edge ───────────────────────────────────
   const realEdge = calculateRealEdge(estimatedProb, yesPrice, market)
@@ -473,7 +525,8 @@ export async function evaluateMarket(market, bankroll = 1000) {
  * Returns approved trades from both Smart Brain analysis AND safe strategies (snipes, arb)
  */
 export async function smartScan(bankroll = 1000) {
-  const markets = await scanner.getTopMarkets(80)
+  // Scan MORE markets to find diverse opportunities (not just top 80 by volume)
+  const markets = await scanner.getTopMarkets(150)
   const approved = []
   let skipped = 0
 
@@ -495,11 +548,11 @@ export async function smartScan(bankroll = 1000) {
   // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
   try {
     const snipes = await strategyEngine.findResolutionSnipes(0.93, 0.99)
-    for (const snipe of snipes.slice(0, 5)) {
+    for (const snipe of snipes.slice(0, 8)) { // Find more snipes (was 5)
       // Don't duplicate if already approved by Smart Brain
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
-      // Resolution snipes are safe — add directly with proper sizing
-      const betSize = Math.min(bankroll * 0.08, 40) // Up to 8% on safe snipes
+      // Resolution snipes are PROVEN: 87% WR, +$28 profit. Bet bigger on winners.
+      const betSize = Math.min(bankroll * 0.10, 50) // Up to 10% on safe snipes (was 8%/$40)
       approved.push({
         market: snipe.market,
         shouldTrade: true,

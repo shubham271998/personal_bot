@@ -76,11 +76,11 @@ import cloudDb from "./src/cloud-db.mjs"
 import db from "./src/database.mjs"
 
 // ── Config ──────────────────────────────────────────────────
-// BOT_ROLE: "both" = coding + trading (local), "trading" = PM only (cloud), "coding" = Claude only
-const BOT_ROLE = process.env.BOT_ROLE || (process.platform === "darwin" ? "both" : "trading")
-const IS_TRADING_BOT = BOT_ROLE === "trading" || BOT_ROLE === "both"
-const IS_CODING_BOT = BOT_ROLE === "coding" || BOT_ROLE === "both"
-const BOT_MODE = BOT_ROLE === "both" ? "🏠 Local (Full)" : IS_CODING_BOT ? "🏠 Local" : "☁️ Cloud"
+// BOT_ROLE: "trading" = PM agent (cloud/Railway), "coding" = Claude assistant (local mac)
+const BOT_ROLE = process.env.BOT_ROLE || (process.platform === "darwin" ? "coding" : "trading")
+const IS_TRADING_BOT = BOT_ROLE === "trading"
+const IS_CODING_BOT = BOT_ROLE === "coding"
+const BOT_MODE = IS_CODING_BOT ? "🏠 Local" : "☁️ Cloud"
 const BOT_TAG = IS_CODING_BOT ? "🏠" : "☁️"
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!BOT_TOKEN) {
