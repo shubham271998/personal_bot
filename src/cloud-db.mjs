@@ -280,6 +280,32 @@ export async function pullFromCloud(localDb) {
         pulled++
       } catch {}
     }
+
+    // Pull AI research (local daemon pushes → Turso → cloud bot pulls)
+    try {
+      localDb.prepare(`CREATE TABLE IF NOT EXISTS pm_research (
+        market_id TEXT PRIMARY KEY, market_question TEXT, category TEXT,
+        yes_price REAL, volume_24h REAL, ai_probability REAL, ai_confidence TEXT,
+        ai_direction TEXT, ai_reasoning TEXT, ai_headlines TEXT, ai_model TEXT,
+        researched_at TEXT, expires_at TEXT
+      )`).run()
+    } catch {}
+
+    try {
+      const research = await client.execute("SELECT * FROM pm_research WHERE expires_at > datetime('now')")
+      for (const r of research.rows) {
+        try {
+          localDb.prepare(`INSERT OR REPLACE INTO pm_research (market_id, market_question, category, yes_price, volume_24h,
+            ai_probability, ai_confidence, ai_direction, ai_reasoning, ai_headlines, ai_model, researched_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+            r.market_id, r.market_question, r.category, r.yes_price, r.volume_24h,
+            r.ai_probability, r.ai_confidence, r.ai_direction, r.ai_reasoning, r.ai_headlines,
+            r.ai_model, r.researched_at, r.expires_at,
+          )
+          pulled++
+        } catch {}
+      }
+    } catch {}
   } catch (err) {
     console.error("[CLOUD-DB] Pull error:", err.message)
   }
@@ -295,7 +321,7 @@ export async function getStats() {
   if (!client) return null
 
   try {
-    const tables = ["pm_virtual_portfolio", "pm_predictions", "pm_lessons", "pm_strategy_weights", "pm_brier_scores", "pm_eval_scores", "pm_decisions"]
+    const tables = ["pm_virtual_portfolio", "pm_predictions", "pm_lessons", "pm_strategy_weights", "pm_brier_scores", "pm_eval_scores", "pm_decisions", "pm_research"]
     const stats = {}
     for (const table of tables) {
       try {

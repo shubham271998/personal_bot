@@ -1,37 +1,76 @@
 /**
- * Market Analyst — Uses Claude AI to UNDERSTAND markets before betting
+ * Market Analyst — Reads AI research from database
  *
- * The problem: keyword matching can't understand "Trump pushes war with Iran,
- * drops ceasefire odds" means ceasefire is LESS likely. Only an LLM can.
+ * Architecture:
+ *   Local Mac → Claude CLI → deep analysis → pm_research (local DB + Turso cloud)
+ *   Cloud Bot → reads pm_research from Turso → uses AI probability for trading
  *
- * Flow:
- *   1. Gather context (headlines, market data, price history)
- *   2. Ask Claude Haiku to analyze: what's the real probability?
- *   3. Compare Claude's estimate vs market price → find edge
+ * The local research daemon does the heavy lifting (free, uses CLI OAuth).
+ * This module just reads the cached results.
  *
- * Cost: ~$0.001 per analysis (Haiku) — cheaper than one bad trade
- * Only called for markets that pass cheap checks (5-10 per cycle, not all 150)
+ * Fallback: If no research cached AND ANTHROPIC_API_KEY available, calls Haiku directly.
  */
+import db from "../database.mjs"
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || ""
 let Anthropic = null
 
-// Lazy-load SDK only when needed
+// Ensure research table exists locally
+try {
+  db.raw.exec(`
+    CREATE TABLE IF NOT EXISTS pm_research (
+      market_id TEXT PRIMARY KEY, market_question TEXT, category TEXT,
+      yes_price REAL, volume_24h REAL, ai_probability REAL, ai_confidence TEXT,
+      ai_direction TEXT, ai_reasoning TEXT, ai_headlines TEXT, ai_model TEXT,
+      researched_at TEXT, expires_at TEXT
+    )
+  `)
+} catch {}
+
+const researchStmts = {
+  get: db.raw.prepare(`SELECT * FROM pm_research WHERE market_id = ? AND expires_at > datetime('now')`),
+  count: db.raw.prepare(`SELECT COUNT(*) as c FROM pm_research WHERE expires_at > datetime('now')`),
+}
+
 async function getClient() {
   if (!ANTHROPIC_KEY) return null
   if (!Anthropic) {
     try {
       const mod = await import("@anthropic-ai/sdk")
       Anthropic = mod.default
-    } catch {
-      return null
-    }
+    } catch { return null }
   }
   return new Anthropic({ apiKey: ANTHROPIC_KEY })
 }
 
 /**
- * Ask Claude to analyze a market and estimate the real probability
+ * Get cached research for a market (from local DB, synced from Turso)
+ */
+export function getCachedResearch(marketId) {
+  try {
+    const row = researchStmts.get.get(marketId)
+    if (!row) return null
+    return {
+      probability: row.ai_probability,
+      confidence: row.ai_confidence,
+      direction: row.ai_direction,
+      reasoning: row.ai_reasoning,
+      model: row.ai_model || "claude-cli",
+      cached: true,
+      researchedAt: row.researched_at,
+    }
+  } catch { return null }
+}
+
+/**
+ * Get count of available research
+ */
+export function getResearchCount() {
+  try { return researchStmts.count.get()?.c || 0 } catch { return 0 }
+}
+
+/**
+ * Analyze a market — first checks research cache (from local daemon), then fallback to Haiku API
  *
  * @param {object} market - Market data from scanner
  * @param {string[]} headlines - News headlines about this topic
@@ -39,6 +78,13 @@ async function getClient() {
  * @returns {{ probability: number, direction: string, confidence: string, reasoning: string }}
  */
 export async function analyzeMarket(market, headlines = [], context = {}) {
+  // FIRST: check cached research from local daemon (free, Claude CLI powered)
+  const cached = getCachedResearch(market.id)
+  if (cached) {
+    return cached
+  }
+
+  // FALLBACK: call Haiku API directly (costs ~$0.001)
   const client = await getClient()
   if (!client) return null
 
@@ -116,10 +162,10 @@ RULES:
 }
 
 /**
- * Quick check if analysis is available (has API key)
+ * Check if analysis is available (cached research OR API key)
  */
 export function isAvailable() {
-  return !!ANTHROPIC_KEY
+  return getResearchCount() > 0 || !!ANTHROPIC_KEY
 }
 
-export default { analyzeMarket, isAvailable }
+export default { analyzeMarket, isAvailable, getCachedResearch, getResearchCount }
