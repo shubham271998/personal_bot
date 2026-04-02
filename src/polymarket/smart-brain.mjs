@@ -20,6 +20,7 @@ import adaptiveLearner from "./adaptive-learner.mjs"
 import strategyEngine from "./strategy-engine.mjs"
 import researcher from "./web-researcher.mjs"
 import analyst from "./market-analyst.mjs"
+import whaleTracker from "./whale-tracker.mjs"
 
 // ── Constants from research ─────────────────────────────────
 
@@ -298,24 +299,33 @@ export async function evaluateMarket(market, bankroll = 1000) {
     }
   } catch {}
 
-  // ── Check 5: Whale activity ───────────────────────────────
+  // ── Check 5: Smart money / whale tracking ──────────────────
   let whaleSignal = 0
   try {
-    const tokenId = market.outcomes[0].tokenId
-    if (tokenId) {
-      const whale = await selfImprover.detectWhaleActivity(tokenId)
-      if (whale && whale.whaleDirection !== "NEUTRAL") {
-        const whaleStrength = Math.abs(whale.ratio - 0.5) * 2 // 0 to 1
-        if (whaleStrength > 0.3) { // Only count strong whale signals
-          whaleSignal = whale.whaleDirection === "BULLISH" ? whaleStrength * 0.08 : -whaleStrength * 0.08
-          result.reasoning.push(
-            `Whales: ${whale.whaleDirection} (${(whale.ratio * 100).toFixed(0)}% buy pressure, strength ${(whaleStrength * 100).toFixed(0)}%)`,
-          )
-          result.checks.whaleCheck = true
+    const smartMoney = await whaleTracker.analyzeSmartMoney(market)
+    if (smartMoney && smartMoney.hasSignal) {
+      whaleSignal = smartMoney.direction === "YES" ? smartMoney.strength * 0.04 : smartMoney.direction === "NO" ? -smartMoney.strength * 0.04 : 0
+      result.reasoning.push(
+        `Smart money: ${smartMoney.direction} (${smartMoney.whaleCount} whales, ${(smartMoney.buyPressure * 100).toFixed(0)}% buy, strength ${(smartMoney.strength * 100).toFixed(0)}%)`,
+      )
+      result.checks.whaleCheck = true
+    }
+  } catch {
+    // Fallback to basic order book check
+    try {
+      const tokenId = market.outcomes[0].tokenId
+      if (tokenId) {
+        const whale = await selfImprover.detectWhaleActivity(tokenId)
+        if (whale && whale.whaleDirection !== "NEUTRAL") {
+          const whaleStrength = Math.abs(whale.ratio - 0.5) * 2
+          if (whaleStrength > 0.3) {
+            whaleSignal = whale.whaleDirection === "BULLISH" ? whaleStrength * 0.04 : -whaleStrength * 0.04
+            result.checks.whaleCheck = true
+          }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   // ── Check 6: Trading window ───────────────────────────────
   const timingWindow = selfImprover.getTradingWindow()
@@ -504,25 +514,28 @@ export async function evaluateMarket(market, bankroll = 1000) {
       result.reasoning.push("Direction unclear — skip")
     }
 
-    // Kelly sizing with fractional Kelly (0.25) and strategy weight
+    // Kelly sizing — deploy MORE capital, we've been too conservative (85% idle)
     if (result.shouldTrade) {
-      // Catastrophe reserve: only deploy 80% of bankroll max
-      const deployable = bankroll * (1 - CATASTROPHE_RESERVE)
+      // Catastrophe reserve: keep 30% cash (was 20% — slightly more cautious per trade but more trades)
+      const deployable = bankroll * 0.70
       const odds = result.direction === "BUY_YES" ? 1 / yesPrice - 1 : 1 / noPrice - 1
       const kelly = Math.max(0, (realEdge * odds - (1 - estimatedProb)) / odds)
       const timeMultiplier = timingWindow.sizeMultiplier
 
-      // Category-based sizing from LEARNED performance (not just hardcoded)
+      // Category-based sizing from LEARNED performance
       const categoryMultiplier = adaptiveLearner.getCategoryConfidence(category)
 
       // Lesson penalty: if we've lost repeatedly on similar trades, reduce size
       const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
 
+      // Claude AI confidence boost: if Claude analyzed this market with high confidence, bet more
+      const aiBoost = usedClaude ? 1.3 : 1.0
+
       result.betSize = Math.min(
-        deployable * 0.05, // Max 5% of deployable (not total bankroll)
-        kelly * 0.25 * deployable * stratWeight * timeMultiplier * categoryMultiplier * lessonPenalty,
+        deployable * 0.08, // Max 8% per trade (was 5% — too conservative)
+        kelly * 0.30 * deployable * stratWeight * timeMultiplier * categoryMultiplier * lessonPenalty * aiBoost,
       )
-      result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100) // Min $3
+      result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100)
       result.reasoning.push(`Bet: $${result.betSize.toFixed(2)} (Kelly ${(kelly * 100).toFixed(1)}% × strat ${(stratWeight * 100).toFixed(0)}% × cat ${(categoryMultiplier * 100).toFixed(0)}% × lesson ${(lessonPenalty * 100).toFixed(0)}%)`)
     }
   }
@@ -561,12 +574,12 @@ export async function smartScan(bankroll = 1000) {
 
   // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
   try {
-    const snipes = await strategyEngine.findResolutionSnipes(0.93, 0.99)
-    for (const snipe of snipes.slice(0, 8)) { // Find more snipes (was 5)
+    const snipes = await strategyEngine.findResolutionSnipes(0.92, 0.99) // Widen range (was 0.93)
+    for (const snipe of snipes.slice(0, 12)) { // Find up to 12 snipes
       // Don't duplicate if already approved by Smart Brain
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
-      // Resolution snipes are PROVEN: 87% WR, +$28 profit. Bet bigger on winners.
-      const betSize = Math.min(bankroll * 0.10, 50) // Up to 10% on safe snipes (was 8%/$40)
+      // Resolution snipes are PROVEN: 87% WR, +$28 profit. The money machine.
+      const betSize = Math.min(bankroll * 0.12, 60) // Up to 12% / $60 per snipe
       approved.push({
         market: snipe.market,
         shouldTrade: true,

@@ -154,7 +154,7 @@ function askClaude(prompt) {
 
 // ── Market analysis ────────────────────────────────────────
 
-async function analyzeMarket(market, headlines) {
+async function analyzeMarket(market, headlines, redditPosts = []) {
   const question = market.question || ""
   const yesPrice = market.outcomes?.[0]?.price || 0.5
 
@@ -162,23 +162,36 @@ async function analyzeMarket(market, headlines) {
     ? "\n\nRecent headlines:\n" + headlines.map(h => `- ${h}`).join("\n")
     : "\n\n(No recent headlines found)"
 
-  const prompt = `You are an expert prediction market analyst. Analyze this Polymarket question and give your probability estimate.
+  const redditText = redditPosts.length > 0
+    ? "\n\nReddit discussion:\n" + redditPosts.map(p => `- r/${p.subreddit}: "${p.title}" (${p.score} upvotes, ${p.comments} comments)`).join("\n")
+    : ""
+
+  const prompt = `You are an expert prediction market analyst and trader. Analyze this Polymarket question deeply.
 
 MARKET: "${question}"
 Current market price (YES): ${(yesPrice * 100).toFixed(1)}%
 24h Volume: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
-${headlineText}
+${headlineText}${redditText}
 
-Respond ONLY with this JSON (no other text):
-{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "1-2 sentences"}
+Think step by step:
+1. What is this market actually asking? What outcome counts as YES?
+2. What do the headlines tell you about the LIKELIHOOD of this specific outcome?
+3. What's the base rate for this type of event? (Most dramatic events don't happen)
+4. Is the market price too high, too low, or about right?
+5. What would change your mind? What's the key uncertainty?
+
+Then respond ONLY with this JSON (no other text):
+{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "2-3 sentences with specific evidence from headlines or facts"}
 
 RULES:
-- probability: your honest estimate (0.01-0.99) for YES outcome
-- The market price reflects thousands of traders. You need STRONG reason to deviate >10%.
-- Most "Will dramatic event happen by date?" → NO. Status quo usually wins.
-- "War news" about a "ceasefire?" market = ceasefire LESS likely, not more.
-- direction: YES = you think market underprices YES. NO = overprices. FAIR = correct.
-- If uncertain, say FAIR with market price as probability.`
+- probability: your honest estimate (0.01-0.99) for YES
+- The market has thousands of traders. You need STRONG reason to deviate >10%.
+- Most "Will X happen by date?" → NO. Status quo wins 80%+ of the time.
+- UNDERSTAND the question: "ceasefire?" + war news = ceasefire LESS likely.
+- "regime fall?" + military pressure = regime change is extremely rare historically.
+- direction: YES = market underprices, NO = market overprices, FAIR = correct.
+- If uncertain, say FAIR. Better to skip than bet wrong.
+- Be specific in reasoning — cite headlines or historical facts.`
 
   try {
     const response = await askClaude(prompt)
@@ -241,15 +254,20 @@ async function runResearchCycle() {
   for (const market of interesting) {
     const category = brain.detectCategory(market.question)
 
-    // Get headlines
+    // Get headlines + Reddit posts
     let headlines = []
+    let redditPosts = []
     try {
       const news = await newsAnalyzer.searchNews(market.question.slice(0, 40), 5)
       headlines = news.map(h => h.title).filter(Boolean)
     } catch {}
+    try {
+      const researcher = await import("./web-researcher.mjs")
+      redditPosts = await researcher.searchReddit(market.question.slice(0, 40), 3)
+    } catch {}
 
-    // Ask Claude CLI
-    const analysis = await analyzeMarket(market, headlines)
+    // Ask Claude CLI with headlines + Reddit context
+    const analysis = await analyzeMarket(market, headlines, redditPosts)
     if (!analysis) continue
 
     // Store in local DB

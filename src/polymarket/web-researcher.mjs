@@ -168,7 +168,7 @@ const PM_TWITTER_ACCOUNTS = [
 ]
 
 /**
- * Get recent tweets about a topic via DuckDuckGo
+ * Search Twitter/X for market sentiment
  */
 export async function searchTwitter(query, limit = 5) {
   try {
@@ -177,6 +177,32 @@ export async function searchTwitter(query, limit = 5) {
       text: r.snippet || r.title,
       url: r.url,
       source: "twitter_search",
+    }))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Search Reddit for community sentiment and discussion
+ * Uses Reddit's JSON API (free, no auth needed)
+ */
+export async function searchReddit(query, limit = 5) {
+  try {
+    const { data } = await axios.get(`https://www.reddit.com/search.json`, {
+      params: { q: `${query} polymarket OR prediction`, sort: "relevance", t: "week", limit },
+      headers: { "User-Agent": "Mozilla/5.0 (research-bot)" },
+      timeout: RESEARCH_TIMEOUT,
+    })
+
+    return (data?.data?.children || []).map(c => ({
+      title: c.data?.title || "",
+      subreddit: c.data?.subreddit || "",
+      score: c.data?.score || 0,
+      comments: c.data?.num_comments || 0,
+      text: (c.data?.selftext || "").slice(0, 200),
+      url: c.data?.url || "",
+      source: "reddit",
     }))
   } catch {
     return []
@@ -475,7 +501,7 @@ export async function researchMarket(market, category = "other") {
       .catch(() => {}),
   )
 
-  // Always: social sentiment
+  // Always: social sentiment (Twitter + Reddit)
   tasks.push(
     getSocialSentiment(question)
       .then(sentiment => {
@@ -487,7 +513,29 @@ export async function researchMarket(market, category = "other") {
               source: "social",
               direction: sentiment.sentiment,
               strength: sentiment.strength,
-              detail: `Twitter: ${sentiment.bullish}B/${sentiment.bearish}R (${sentiment.total} tweets)`,
+              detail: `Social: ${sentiment.bullish}B/${sentiment.bearish}R (${sentiment.total} posts)`,
+            })
+          }
+        }
+      })
+      .catch(() => {}),
+  )
+
+  // Reddit discussion
+  tasks.push(
+    searchReddit(question.slice(0, 40), 5)
+      .then(posts => {
+        if (posts.length > 0) {
+          report.sources.push({ type: "reddit", count: posts.length })
+          report.redditPosts = posts.slice(0, 3)
+          // High-engagement Reddit = market attention = potential for quick moves
+          const totalEngagement = posts.reduce((s, p) => s + p.score + p.comments, 0)
+          if (totalEngagement > 50) {
+            report.signals.push({
+              source: "reddit",
+              direction: "neutral", // Reddit engagement doesn't give direction directly
+              strength: Math.min(1, totalEngagement / 200),
+              detail: `Reddit: ${posts.length} posts, ${totalEngagement} engagement (${posts[0]?.subreddit})`,
             })
           }
         }
