@@ -74,17 +74,24 @@ const stmts = {
 }
 
 // ── Turso sync ─────────────────────────────────────────────
-const TURSO_URL = process.env.TURSO_DB_URL || ""
-const TURSO_TOKEN = process.env.TURSO_DB_TOKEN || ""
 let turso = null
 
 function initTurso() {
-  if (!TURSO_URL || !TURSO_TOKEN) return false
+  // Read env at call time (after .env is loaded by main())
+  const url = process.env.TURSO_DB_URL || ""
+  const token = process.env.TURSO_DB_TOKEN || ""
+  if (!url || !token) {
+    console.log("[RESEARCH] No Turso credentials — research stays local only")
+    return false
+  }
   try {
-    turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN })
-    console.log("[RESEARCH] Turso connected")
+    turso = createClient({ url, authToken: token })
+    console.log("[RESEARCH] Turso connected — research will sync to cloud")
     return true
-  } catch { return false }
+  } catch (err) {
+    console.error("[RESEARCH] Turso failed:", err.message)
+    return false
+  }
 }
 
 async function setupTursoTable() {
@@ -102,7 +109,7 @@ async function setupTursoTable() {
 }
 
 async function syncToTurso() {
-  if (!turso) return 0
+  if (!turso) { console.log("[RESEARCH] Turso not connected — skipping sync"); return 0 }
   const rows = stmts.getAllValid.all()
   let synced = 0
   for (const r of rows) {
