@@ -101,6 +101,22 @@ export async function setupTables() {
       real_edge REAL, score REAL, bet_size REAL,
       checks TEXT, reasoning TEXT, created_at TEXT
     )`,
+    `CREATE TABLE IF NOT EXISTS pm_category_stats (
+      category TEXT PRIMARY KEY, total_trades INTEGER DEFAULT 0,
+      wins INTEGER DEFAULT 0, total_pnl REAL DEFAULT 0, confidence REAL DEFAULT 0.5
+    )`,
+    `CREATE TABLE IF NOT EXISTS pm_whale_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT, market_question TEXT,
+      direction TEXT, whale_count INTEGER DEFAULT 0, total_volume REAL DEFAULT 0,
+      signal_strength REAL DEFAULT 0, created_at TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS pm_virtual_stats (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT UNIQUE,
+      starting_balance REAL, ending_balance REAL, trades_opened INTEGER DEFAULT 0,
+      trades_closed INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+      day_pnl REAL DEFAULT 0, total_pnl REAL DEFAULT 0, win_rate REAL DEFAULT 0,
+      best_trade REAL DEFAULT 0, worst_trade REAL DEFAULT 0, rating TEXT
+    )`,
   ]
 
   for (const sql of tables) {
@@ -229,6 +245,34 @@ export async function syncToCloud(localDb) {
         } catch {}
       }
     } catch {}
+
+    // Sync category stats
+    try {
+      const cats = localDb.prepare(`SELECT * FROM pm_category_stats`).all()
+      for (const c of cats) {
+        try {
+          await client.execute({
+            sql: `INSERT OR REPLACE INTO pm_category_stats (category, total_trades, wins, total_pnl, confidence) VALUES (?, ?, ?, ?, ?)`,
+            args: [c.category, c.total_trades, c.wins, c.total_pnl, c.confidence],
+          })
+          synced++
+        } catch {}
+      }
+    } catch {}
+
+    // Sync research (local daemon → cloud for cloud bot to read)
+    try {
+      const research = localDb.prepare(`SELECT * FROM pm_research WHERE expires_at > datetime('now')`).all()
+      for (const r of research) {
+        try {
+          await client.execute({
+            sql: `INSERT OR REPLACE INTO pm_research (market_id, market_question, category, yes_price, volume_24h, ai_probability, ai_confidence, ai_direction, ai_reasoning, ai_headlines, ai_model, researched_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [r.market_id, r.market_question, r.category, r.yes_price, r.volume_24h, r.ai_probability, r.ai_confidence, r.ai_direction, r.ai_reasoning, r.ai_headlines, r.ai_model, r.researched_at, r.expires_at],
+          })
+          synced++
+        } catch {}
+      }
+    } catch {}
   } catch (err) {
     console.error("[CLOUD-DB] Sync error:", err.message)
   }
@@ -301,6 +345,37 @@ export async function pullFromCloud(localDb) {
             r.market_id, r.market_question, r.category, r.yes_price, r.volume_24h,
             r.ai_probability, r.ai_confidence, r.ai_direction, r.ai_reasoning, r.ai_headlines,
             r.ai_model, r.researched_at, r.expires_at,
+          )
+          pulled++
+        } catch {}
+      }
+    } catch {}
+
+    // Pull category stats
+    try {
+      localDb.prepare(`CREATE TABLE IF NOT EXISTS pm_category_stats (
+        category TEXT PRIMARY KEY, total_trades INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0, total_pnl REAL DEFAULT 0, confidence REAL DEFAULT 0.5
+      )`).run()
+      const cats = await client.execute("SELECT * FROM pm_category_stats WHERE total_trades > 0")
+      for (const c of cats.rows) {
+        try {
+          localDb.prepare(`INSERT OR REPLACE INTO pm_category_stats (category, total_trades, wins, total_pnl, confidence) VALUES (?, ?, ?, ?, ?)`).run(
+            c.category, c.total_trades, c.wins, c.total_pnl, c.confidence,
+          )
+          pulled++
+        } catch {}
+      }
+    } catch {}
+
+    // Pull portfolio (full sync — cloud is source of truth for trading data)
+    try {
+      const trades = await client.execute("SELECT * FROM pm_virtual_portfolio ORDER BY id DESC LIMIT 200")
+      for (const t of trades.rows) {
+        try {
+          localDb.prepare(`INSERT OR REPLACE INTO pm_virtual_portfolio (id, market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, status, exit_price, pnl, created_at, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+            t.id, t.market_id, t.market_question, t.outcome, t.side, t.entry_price, t.shares, t.size_usdc, t.strategy, t.status, t.exit_price, t.pnl, t.created_at, t.closed_at,
           )
           pulled++
         } catch {}
