@@ -358,7 +358,7 @@ export async function evaluateMarket(market, bankroll = 1000) {
   let estimatedProb = yesPrice
   let usedClaude = false
 
-  if (analyst.isAvailable() && cheapChecksPassed >= 3) {
+  if ((await analyst.isAvailable()) && cheapChecksPassed >= 3) {
     try {
       // Gather context for Claude
       const headlines = []

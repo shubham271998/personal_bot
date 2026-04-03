@@ -250,9 +250,12 @@ if (cloudDb.init()) {
     })
   })
 
-  // Sync local → cloud every 5 minutes
+  // Bidirectional sync every 5 minutes
   setInterval(() => {
+    // Push local data → cloud
     cloudDb.syncToCloud(db.raw).catch(() => {})
+    // Pull cloud data → local (research from local daemon, strategy weights, etc.)
+    cloudDb.pullFromCloud(db.raw).catch(() => {})
   }, 5 * 60 * 1000)
 }
 
