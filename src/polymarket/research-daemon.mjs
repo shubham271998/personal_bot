@@ -226,7 +226,7 @@ async function analyzeMarket(market, headlines, redditPosts = [], expertSummary 
   const question = market.question || ""
   const yesPrice = market.outcomes?.[0]?.price || 0.5
   const brain = await import("./smart-brain.mjs")
-  const category = brain.detectCategory(question)
+  const category = (brain.default?.detectCategory || brain.detectCategory)(question)
   const useDeep = shouldDoDeepResearch(market, category)
 
   if (useDeep) {
