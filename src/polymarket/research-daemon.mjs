@@ -131,7 +131,11 @@ async function syncToTurso() {
 
 // ── Claude CLI runner ──────────────────────────────────────
 
-function askClaude(prompt) {
+/**
+ * Quick analysis — single prompt, no tools, ~10-15 seconds
+ * Good for: sports, simple yes/no, markets with clear context
+ */
+function askClaudeQuick(prompt) {
   return new Promise((resolve, reject) => {
     const proc = spawn("claude", ["-p", "--output-format", "json", prompt], {
       env: { ...process.env },
@@ -159,64 +163,172 @@ function askClaude(prompt) {
   })
 }
 
+/**
+ * DEEP research — full tools enabled (WebSearch, WebFetch), multi-step
+ * Claude searches the web, reads articles, follows leads, synthesizes
+ * Takes 30-90 seconds but produces expert-level analysis
+ * Good for: geopolitical, politics, economics, crypto — high-value non-sports markets
+ */
+function askClaudeDeep(prompt) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("claude", [
+      "-p",
+      "--dangerously-skip-permissions",
+      "--output-format", "json",
+      prompt,
+    ], {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 120000, // 2 min for deep research
+    })
+
+    let stdout = ""
+    let stderr = ""
+    proc.stdout.on("data", d => stdout += d.toString())
+    proc.stderr.on("data", d => stderr += d.toString())
+
+    proc.on("close", code => {
+      if (code !== 0 && !stdout) {
+        return reject(new Error(`Claude deep exit ${code}: ${stderr.slice(0, 200)}`))
+      }
+      try {
+        const parsed = JSON.parse(stdout)
+        resolve(parsed.result || stdout)
+      } catch {
+        resolve(stdout.trim())
+      }
+    })
+    proc.on("error", reject)
+  })
+}
+
 // ── Market analysis ────────────────────────────────────────
+
+/**
+ * Decide research depth based on market characteristics
+ * DEEP: geopolitical, politics, economics, crypto, high volume (>$50K)
+ * QUICK: sports, entertainment, low volume
+ */
+function shouldDoDeepResearch(market, category) {
+  // Sports/esports: quick analysis (outcomes are unpredictable, research doesn't help much)
+  if (/\bvs\.?\b|win on 2026|o\/u|spread|handicap|esports|counter-strike|lol:/i.test(market.question || "")) return false
+  // High value markets: deep research
+  if (market.volume24hr > 50000) return true
+  // Non-sports categories: deep research
+  if (["geopolitical", "politics", "economics", "crypto"].includes(category)) return true
+  // Interesting odds (not near 0 or 100): deep research
+  const price = market.outcomes?.[0]?.price || 0.5
+  if (price > 0.15 && price < 0.85) return true
+  return false
+}
 
 async function analyzeMarket(market, headlines, redditPosts = [], expertSummary = "") {
   const question = market.question || ""
   const yesPrice = market.outcomes?.[0]?.price || 0.5
+  const brain = await import("./smart-brain.mjs")
+  const category = brain.detectCategory(question)
+  const useDeep = shouldDoDeepResearch(market, category)
 
-  const headlineText = headlines.length > 0
-    ? "\n\nRecent headlines:\n" + headlines.map(h => `- ${h}`).join("\n")
-    : "\n\n(No recent headlines found)"
+  if (useDeep) {
+    return analyzeDeep(market, question, yesPrice)
+  } else {
+    return analyzeQuick(market, question, yesPrice, headlines, redditPosts, expertSummary)
+  }
+}
 
-  const redditText = redditPosts.length > 0
-    ? "\n\nReddit discussion:\n" + redditPosts.map(p => `- r/${p.subreddit}: "${p.title}" (${p.score} upvotes, ${p.comments} comments)`).join("\n")
-    : ""
-
-  // Expert intel: YouTube analysis transcripts + expert Twitter opinions
-  const expertText = expertSummary ? `\n${expertSummary}` : ""
-
-  const prompt = `You are an expert prediction market analyst and trader. Analyze this Polymarket question deeply.
+/**
+ * DEEP RESEARCH — Claude searches the web, reads articles, thinks deeply
+ * 30-90 seconds, uses WebSearch + WebFetch tools
+ */
+async function analyzeDeep(market, question, yesPrice) {
+  const prompt = `You are a superforecaster and prediction market expert. Do DEEP research on this market.
 
 MARKET: "${question}"
-Current market price (YES): ${(yesPrice * 100).toFixed(1)}%
+Current Polymarket price (YES): ${(yesPrice * 100).toFixed(1)}%
 24h Volume: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
-${headlineText}${redditText}${expertText}
 
-Think step by step:
-1. What is this market actually asking? What outcome counts as YES?
-2. What do the headlines tell you about the LIKELIHOOD of this specific outcome?
-3. What's the base rate for this type of event? (Most dramatic events don't happen)
-4. Is the market price too high, too low, or about right?
-5. What would change your mind? What's the key uncertainty?
+RESEARCH STEPS:
+1. Search the web for the LATEST news about this topic (use specific search queries)
+2. Read at least 2-3 news articles to understand the current situation
+3. Check what experts and analysts are saying
+4. Consider the base rate — how often do events like this actually happen?
+5. Compare what you found vs the market price — is there a real edge?
 
-Then respond ONLY with this JSON (no other text):
-{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "2-3 sentences with specific evidence from headlines or facts"}
+After your research, respond with ONLY this JSON block:
+\`\`\`json
+{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "3-4 sentences citing SPECIFIC facts, dates, and sources you found", "sources": ["source1", "source2"]}
+\`\`\`
 
 RULES:
-- probability: your honest estimate (0.01-0.99) for YES
-- The market has thousands of traders. You need STRONG reason to deviate >10%.
-- Most "Will X happen by date?" → NO. Status quo wins 80%+ of the time.
-- UNDERSTAND the question: "ceasefire?" + war news = ceasefire LESS likely.
-- "regime fall?" + military pressure = regime change is extremely rare historically.
-- direction: YES = market underprices, NO = market overprices, FAIR = correct.
-- If uncertain, say FAIR. Better to skip than bet wrong.
-- Be specific in reasoning — cite headlines or historical facts.`
+- Search for RECENT news (April 2026). Your knowledge may be outdated.
+- The market has thousands of traders. You need SPECIFIC NEW INFORMATION to disagree.
+- "Will X happen by date?" — status quo wins 80%+ of the time. Be skeptical.
+- War news on ceasefire market = ceasefire LESS likely, not more.
+- If your research doesn't find a clear edge, say FAIR.
+- Be SPECIFIC: cite article titles, dates, named officials, specific facts.`
 
   try {
-    const response = await askClaude(prompt)
+    console.log(`[RESEARCH] 🔬 Deep research: "${question.slice(0, 40)}"...`)
+    const response = await askClaudeDeep(prompt)
+    const jsonMatch = response.match(/```json\s*([\s\S]*?)```/) || response.match(/\{[\s\S]*"probability"[\s\S]*\}/)
+    if (!jsonMatch) {
+      // Try to extract from full response
+      const lastJson = response.match(/\{[^{}]*"probability"[^{}]*\}/g)
+      if (!lastJson) return null
+      const analysis = JSON.parse(lastJson[lastJson.length - 1])
+      return formatAnalysis(analysis, yesPrice, "deep")
+    }
+    const jsonStr = jsonMatch[1] || jsonMatch[0]
+    const analysis = JSON.parse(jsonStr)
+    return formatAnalysis(analysis, yesPrice, "deep")
+  } catch (err) {
+    console.error(`[RESEARCH] Deep failed for "${question.slice(0, 40)}": ${err.message}`)
+    // Fallback to quick
+    return analyzeQuick(market, question, yesPrice, [], [], "")
+  }
+}
+
+/**
+ * QUICK ANALYSIS — single prompt with provided context, ~10 seconds
+ */
+async function analyzeQuick(market, question, yesPrice, headlines = [], redditPosts = [], expertSummary = "") {
+  const headlineText = headlines.length > 0
+    ? "\n\nRecent headlines:\n" + headlines.map(h => `- ${h}`).join("\n")
+    : ""
+  const redditText = redditPosts.length > 0
+    ? "\n\nReddit:\n" + redditPosts.map(p => `- r/${p.subreddit}: "${p.title}" (${p.score}pts)`).join("\n")
+    : ""
+  const expertText = expertSummary ? `\n${expertSummary}` : ""
+
+  const prompt = `Prediction market analyst. Quick analysis:
+
+MARKET: "${question}"
+YES price: ${(yesPrice * 100).toFixed(1)}% | Vol: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
+${headlineText}${redditText}${expertText}
+
+JSON only: {"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "1-2 sentences"}
+Rules: rarely deviate >10% from market. Status quo wins. If unsure = FAIR.`
+
+  try {
+    const response = await askClaudeQuick(prompt)
     const jsonMatch = response.match(/\{[\s\S]*\}/)
     if (!jsonMatch) return null
     const analysis = JSON.parse(jsonMatch[0])
-    return {
-      probability: Math.max(0.01, Math.min(0.99, parseFloat(analysis.probability) || yesPrice)),
-      confidence: analysis.confidence || "low",
-      direction: analysis.direction || "FAIR",
-      reasoning: (analysis.reasoning || "").slice(0, 500),
-    }
+    return formatAnalysis(analysis, yesPrice, "quick")
   } catch (err) {
-    console.error(`[RESEARCH] Analysis failed for "${question.slice(0, 40)}": ${err.message}`)
+    console.error(`[RESEARCH] Quick failed for "${question.slice(0, 40)}": ${err.message}`)
     return null
+  }
+}
+
+function formatAnalysis(analysis, yesPrice, mode) {
+  return {
+    probability: Math.max(0.01, Math.min(0.99, parseFloat(analysis.probability) || yesPrice)),
+    confidence: analysis.confidence || "low",
+    direction: analysis.direction || "FAIR",
+    reasoning: (analysis.reasoning || "").slice(0, 800), // More room for deep research
+    sources: analysis.sources || [],
+    mode, // "deep" or "quick"
   }
 }
 
@@ -288,7 +400,7 @@ async function runResearchCycle() {
       } catch {}
     }
 
-    // Ask Claude CLI with ALL context
+    // Ask Claude CLI — deep research for high-value, quick for sports/low-value
     const analysis = await analyzeMarket(market, headlines, redditPosts, expertSummary)
     if (!analysis) continue
 
@@ -297,15 +409,16 @@ async function runResearchCycle() {
       market.id, market.question?.slice(0, 200), category,
       market.outcomes?.[0]?.price || 0, market.volume24hr || 0,
       analysis.probability, analysis.confidence, analysis.direction,
-      analysis.reasoning, JSON.stringify(headlines.slice(0, 5)),
+      analysis.reasoning, JSON.stringify((analysis.sources || headlines.map(h=>h.title || h)).slice(0, 5)),
     )
 
     analyzed++
     const emoji = analysis.direction === "YES" ? "📈" : analysis.direction === "NO" ? "📉" : "➡️"
-    console.log(`[RESEARCH] ${emoji} ${market.question?.slice(0, 50)} | mkt:${(market.outcomes[0].price * 100).toFixed(0)}% ai:${(analysis.probability * 100).toFixed(0)}% (${analysis.confidence}) | ${analysis.reasoning?.slice(0, 60)}`)
+    const mode = analysis.mode === "deep" ? "🔬" : "⚡"
+    console.log(`[RESEARCH] ${mode}${emoji} ${market.question?.slice(0, 45)} | mkt:${(market.outcomes[0].price * 100).toFixed(0)}% ai:${(analysis.probability * 100).toFixed(0)}% (${analysis.confidence}) ${analysis.direction} | ${analysis.reasoning?.slice(0, 60)}`)
 
-    // Small delay between Claude calls
-    await new Promise(r => setTimeout(r, 2000))
+    // Delay: 3s after deep research, 1s after quick
+    await new Promise(r => setTimeout(r, analysis.mode === "deep" ? 3000 : 1000))
   }
 
   // Sync to Turso
