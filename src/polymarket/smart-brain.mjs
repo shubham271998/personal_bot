@@ -598,8 +598,8 @@ export async function evaluateMarket(market, bankroll = 1000) {
  * Returns approved trades from both Smart Brain analysis AND safe strategies (snipes, arb)
  */
 export async function smartScan(bankroll = 1000) {
-  // Scan MORE markets to find diverse opportunities (not just top 80 by volume)
-  const markets = await scanner.getTopMarkets(150)
+  // Scan ALL markets — every market is an opportunity
+  const markets = await scanner.getTopMarkets(200)
   const approved = []
   let skipped = 0
 
@@ -620,8 +620,8 @@ export async function smartScan(bankroll = 1000) {
 
   // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
   try {
-    const snipes = await strategyEngine.findResolutionSnipes(0.92, 0.99)
-    for (const snipe of snipes.slice(0, 12)) {
+    const snipes = await strategyEngine.findResolutionSnipes(0.91, 0.99) // Wider range
+    for (const snipe of snipes.slice(0, 20)) { // More snipes — proven 84% WR
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
 
       // SPORTS CAP: anything can happen in sports — max $10 even on 95% snipes
@@ -652,7 +652,60 @@ export async function smartScan(bankroll = 1000) {
     console.error("[BRAIN] Snipe scan failed:", err.message)
   }
 
-  // 3. Arbitrage opportunities (risk-free)
+  // 3. AI Signal Trades — directly trade Claude's YES/NO directional calls
+  // These are the 33 untapped signals where Claude found edge
+  try {
+    const researchCount = await analyst.getResearchCount()
+    if (researchCount > 0) {
+      for (const market of markets) {
+        if (approved.some(a => a.market?.id === market.id)) continue
+        if (approved.length >= 20) break // Cap total approved per scan
+
+        const research = await analyst.getCachedResearch(market.id)
+        if (!research || research.direction === "FAIR") continue
+
+        const yp = market.outcomes?.[0]?.price || 0.5
+        const aiProb = research.probability
+        const edge = Math.abs(aiProb - yp)
+
+        // Only trade if edge > 5% and medium+ confidence
+        if (edge < 0.05) continue
+        if (research.confidence === "low") continue
+
+        // Price range safety
+        if (!adaptiveLearner.isPriceRangeSafe(yp)) continue
+
+        const isSports = /\bvs\.?\b|win on 2026|o\/u|spread|handicap|esports/i.test(market.question || "")
+        const direction = research.direction === "YES" ? "BUY_YES" : "BUY_NO"
+        const outcome = direction === "BUY_YES" ? market.outcomes[0]?.name : market.outcomes[1]?.name || "No"
+
+        // Size based on edge and confidence
+        let betSize = Math.min(bankroll * 0.03, 20) // Base: 3% / $20
+        if (research.confidence === "high") betSize = Math.min(bankroll * 0.05, 30) // High conf: 5% / $30
+        if (isSports) betSize = Math.min(betSize, 10) // Sports cap
+
+        approved.push({
+          market,
+          shouldTrade: true,
+          direction,
+          outcome,
+          confidence: research.confidence === "high" ? 0.85 : 0.7,
+          estimatedProb: aiProb,
+          realEdge: edge,
+          betSize,
+          reasoning: [`🧠 AI Signal: Claude says ${research.direction} at ${(aiProb * 100).toFixed(0)}% vs market ${(yp * 100).toFixed(0)}% (${(edge * 100).toFixed(1)}% edge)`, research.reasoning?.slice(0, 100)],
+          score: edge * 100 * (research.confidence === "high" ? 1.5 : 1.0),
+          category: "ai_signal",
+          strategy: "AI Signal",
+          checksDetail: { aiResearch: true, direction: research.direction },
+        })
+      }
+    }
+  } catch (err) {
+    console.error("[BRAIN] AI Signal scan failed:", err.message)
+  }
+
+  // 4. Arbitrage opportunities (risk-free)
   try {
     const arbs = await strategyEngine.findArbitrage()
     for (const arb of arbs.slice(0, 3)) {

@@ -50,10 +50,12 @@ db.raw.exec(`
 // Initialize default strategy weights
 const DEFAULT_STRATEGIES = {
   "Resolution Snipe": 1.5,    // Start high — safest strategy
+  "AI Signal": 1.2,           // Claude-backed directional trades — high trust
   "NegRisk Arbitrage": 1.5,   // Risk-free
   "Arbitrage": 1.5,           // Risk-free
   "News Alpha": 0.8,          // Medium confidence
   "Momentum": 0.6,            // Lower confidence
+  "Smart Brain": 0.5,         // Needs AI backing to be good
   "Long Shot": 0.3,           // Start low — most risky
 }
 
