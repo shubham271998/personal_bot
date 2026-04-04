@@ -546,43 +546,54 @@ export async function evaluateMarket(market, bankroll = 1000) {
       result.reasoning.push("Direction unclear — skip")
     }
 
-    // Kelly sizing — deploy MORE capital, we've been too conservative (85% idle)
+    // ── PRECISION SIZING — bet size scales with balance, edge, and confidence ──
+    // Data shows: $10-25 bets have 100% WR and $14.85 avg profit
+    // Tiny $3 bets: 41% WR, lose money. Huge $60 bets: blown up by upsets.
+    // Sweet spot: $15-25 on high-conviction trades. Treat virtual as real money.
     if (result.shouldTrade) {
-      // Catastrophe reserve: keep 30% cash (was 20% — slightly more cautious per trade but more trades)
-      const deployable = bankroll * 0.70
-      const odds = result.direction === "BUY_YES" ? 1 / yesPrice - 1 : 1 / noPrice - 1
-      const kelly = Math.max(0, (realEdge * odds - (1 - estimatedProb)) / odds)
-      const timeMultiplier = timingWindow.sizeMultiplier
-
-      // Category-based sizing from LEARNED performance
-      const categoryMultiplier = adaptiveLearner.getCategoryConfidence(category)
-
-      // Lesson penalty: if we've lost repeatedly on similar trades, reduce size
-      const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
-
-      // Claude AI confidence boost: directional call with confidence = bet bigger
-      const aiBoost = claudeHasDirection ? 1.5 : usedClaude ? 1.0 : 0.7 // No AI = smaller bet
-
-      result.betSize = Math.min(
-        deployable * 0.08,
-        kelly * 0.30 * deployable * stratWeight * timeMultiplier * categoryMultiplier * lessonPenalty * aiBoost,
-      )
-
-      // SPORTS CAP: max $10 on any sports market — upsets happen, we can't afford -$60
       const isSportsBrain = SNIPE_ONLY_CATEGORIES.has(category) || /\bvs\.?\b|win on 2026|o\/u|spread|handicap/i.test(question)
+
+      // Scale bet size with BANKROLL (compound growth)
+      const deployable = bankroll * 0.70
+
+      // Base sizing by edge strength × confidence
+      let baseBet
+      if (realEdge > 0.10 && usedClaude) {
+        // HIGH EDGE (>10%) + AI backing → bet big: 4-5% of bankroll
+        baseBet = deployable * 0.05
+        result.reasoning.push(`HIGH EDGE ${(realEdge * 100).toFixed(0)}% + AI → 5% sizing`)
+      } else if (realEdge > 0.05 && usedClaude) {
+        // MEDIUM EDGE (5-10%) + AI → 3% of bankroll
+        baseBet = deployable * 0.03
+      } else if (realEdge > 0.05) {
+        // MEDIUM EDGE no AI → 2%
+        baseBet = deployable * 0.02
+      } else {
+        // LOW EDGE (<5%) → 1.5%
+        baseBet = deployable * 0.015
+      }
+
+      // Price range multiplier — 20-35% range is proven (75% WR, $1.79/trade)
+      if (yesPrice >= 0.20 && yesPrice <= 0.35) {
+        baseBet *= 1.3 // Boost for sweet spot range
+      }
+
+      // Lesson penalty
+      const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
+      baseBet *= lessonPenalty
+
+      // SPORTS: hard cap $10
       if (isSportsBrain) {
-        result.betSize = Math.min(result.betSize, 10) // Hard cap $10 on sports
+        result.betSize = Math.min(baseBet, 10)
+      } else {
+        // Non-sports: cap at $40 max per trade (prevent Bayern-type blowups)
+        result.betSize = Math.min(baseBet, 40)
       }
 
-      // AI-backed non-sports: allow bigger bets (max $30)
-      if (!isSportsBrain && claudeHasDirection) {
-        result.betSize = Math.min(result.betSize, 30)
-      } else if (!isSportsBrain) {
-        result.betSize = Math.min(result.betSize, 15) // No AI backing = smaller
-      }
+      // Floor: minimum $8 (data shows tiny bets lose money, $10-25 range is profitable)
+      result.betSize = Math.max(8, Math.round(result.betSize * 100) / 100)
 
-      result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100)
-      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)}${isSportsBrain ? ' [SPORTS CAP $10]' : ''} (Kelly ${(kelly * 100).toFixed(1)}% × AI ${(aiBoost * 100).toFixed(0)}%)`)
+      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)}${isSportsBrain ? ' [SPORTS $10]' : ''} (edge:${(realEdge * 100).toFixed(0)}% bankroll:$${bankroll.toFixed(0)} → ${(result.betSize/bankroll*100).toFixed(1)}%)`)
     }
   }
 
@@ -624,14 +635,13 @@ export async function smartScan(bankroll = 1000) {
     for (const snipe of snipes.slice(0, 20)) { // More snipes — proven 84% WR
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
 
-      // SPORTS CAP: anything can happen in sports — max $10 even on 95% snipes
-      // Bayern at 93% lost us -$60. Leverkusen at 93% lost us -$112.
-      // Sports upsets happen 15-20% of the time. Keep bets small.
+      // Snipe sizing — scales with bankroll for compound growth
       const snipeCategory = detectCategory(snipe.market?.question || "")
       const isSportsSnipe = SNIPE_ONLY_CATEGORIES.has(snipeCategory) || /\bvs\.?\b|win on 2026|o\/u|spread|handicap/i.test(snipe.market?.question || "")
+      // Sports: $10 max. Non-sports: 3% of bankroll (grows as we make money)
       const betSize = isSportsSnipe
-        ? Math.min(10, bankroll * 0.01) // Sports: MAX $10 (1% of bankroll)
-        : Math.min(bankroll * 0.06, 40) // Non-sports: up to $40 (reduced from $60)
+        ? Math.min(10, bankroll * 0.01)
+        : Math.min(bankroll * 0.03, 35) // 3% of bankroll, max $35
       approved.push({
         market: snipe.market,
         shouldTrade: true,
@@ -679,9 +689,16 @@ export async function smartScan(bankroll = 1000) {
         const direction = research.direction === "YES" ? "BUY_YES" : "BUY_NO"
         const outcome = direction === "BUY_YES" ? market.outcomes[0]?.name : market.outcomes[1]?.name || "No"
 
-        // Size based on edge and confidence
-        let betSize = Math.min(bankroll * 0.03, 20) // Base: 3% / $20
-        if (research.confidence === "high") betSize = Math.min(bankroll * 0.05, 30) // High conf: 5% / $30
+        // Size scales with bankroll + edge + confidence (compound growth)
+        let betSize
+        if (edge > 0.15 && research.confidence === "high") {
+          betSize = bankroll * 0.05 // 5% on massive edge + high confidence
+        } else if (edge > 0.10) {
+          betSize = bankroll * 0.04 // 4% on strong edge
+        } else {
+          betSize = bankroll * 0.025 // 2.5% on moderate edge
+        }
+        betSize = Math.min(betSize, 40) // Max $40
         if (isSports) betSize = Math.min(betSize, 10) // Sports cap
 
         approved.push({

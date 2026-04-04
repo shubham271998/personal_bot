@@ -1055,7 +1055,7 @@ async function runVirtualTradingCycle() {
       }
 
       const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
-      if (betSize < 2 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
+      if (betSize < 5 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
 
       const shares = betSize / price
 
