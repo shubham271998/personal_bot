@@ -377,17 +377,20 @@ export async function evaluateMarket(market, bankroll = 1000) {
         usedClaude = true
         result.checks.researchCheck = true
 
-        // Claude's probability is the BEST estimate we have
-        // But still blend with market: 40% Claude, 60% market (market has more info)
         const claudeProb = analysis.probability
-        const blendWeight = analysis.confidence === "high" ? 0.5 : analysis.confidence === "medium" ? 0.35 : 0.2
-        estimatedProb = claudeProb * blendWeight + yesPrice * (1 - blendWeight)
+        const claudeDirection = analysis.direction // YES, NO, or FAIR
 
-        result.reasoning.push(`🧠 Claude: ${(claudeProb * 100).toFixed(0)}% (${analysis.confidence}) — ${analysis.reasoning}`)
-        result.reasoning.push(`Blend: ${(blendWeight * 100).toFixed(0)}% Claude + ${((1 - blendWeight) * 100).toFixed(0)}% market → ${(estimatedProb * 100).toFixed(1)}%`)
-
-        if (analysis.direction === "FAIR") {
-          result.reasoning.push("Claude says market is fairly priced — no edge")
+        if (claudeDirection === "FAIR") {
+          // Claude says fairly priced — use market price, don't trade on Smart Brain
+          estimatedProb = yesPrice
+          result.reasoning.push(`🧠 Claude: FAIR at ${(claudeProb * 100).toFixed(0)}% (${analysis.confidence}) — ${analysis.reasoning}`)
+        } else {
+          // Claude sees edge! Trust it more when it has a directional call
+          // YES/NO signals are rare (only 7% of markets) — these are high-value
+          const blendWeight = analysis.confidence === "high" ? 0.6 : analysis.confidence === "medium" ? 0.5 : 0.3
+          estimatedProb = claudeProb * blendWeight + yesPrice * (1 - blendWeight)
+          result.reasoning.push(`🧠 Claude: ${claudeDirection} ${(claudeProb * 100).toFixed(0)}% (${analysis.confidence}) — ${analysis.reasoning}`)
+          result.reasoning.push(`Blend: ${(blendWeight * 100).toFixed(0)}% Claude + ${((1 - blendWeight) * 100).toFixed(0)}% market → ${(estimatedProb * 100).toFixed(1)}%`)
         }
       }
     } catch (err) {
@@ -481,28 +484,32 @@ export async function evaluateMarket(market, bankroll = 1000) {
   const checksPassesd = Object.values(result.checks).filter(Boolean).length
   const totalChecks = Object.keys(result.checks).length
 
-  // RELIABILITY FIRST: user funds can't be lost. Be strict.
-  const minChecks = 5 // At least 5/10 checks (tightened from 4)
-  const minEdge = 0.03 // 3% minimum edge after costs
-  const minSignals = 2 // Need 2+ confirming signals
+  // Did Claude give a directional call (YES or NO)?
+  const claudeHasDirection = usedClaude && result.reasoning.some(r => r.includes("🧠 Claude: YES") || r.includes("🧠 Claude: NO"))
+  const claudeSaidFair = usedClaude && result.reasoning.some(r => r.includes("🧠 Claude: FAIR"))
 
-  // CRITICAL: if Claude AI analyzed this and said "FAIR" → don't trade
-  // Claude saying "FAIR" means no edge. Trust it.
-  const claudeSaidFair = usedClaude && result.reasoning.some(r => r.includes("fairly priced") || r.includes("FAIR"))
-  if (claudeSaidFair) {
-    result.reasoning.push("Claude AI says FAIR — no edge, skipping")
-  }
-
-  result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals && !claudeSaidFair
-
-  // EXTRA SAFETY: Smart Brain must have Claude confirmation for any trade
-  // Without Claude research, Smart Brain is just keyword matching — unreliable
-  if (result.shouldTrade && !usedClaude && !result.checks.researchCheck) {
-    // No AI backing — reduce to minimum bet and require extra signal
-    if (confirmingSignals < 3) {
-      result.shouldTrade = false
-      result.reasoning.push("No AI research backing — need 3+ signals without Claude")
+  if (claudeHasDirection) {
+    // CLAUDE HAS AN OPINION — this is rare (only 7% of markets) and valuable
+    // Relax requirements: Claude's directional call IS the edge signal
+    const minEdge = 0.02 // Lower edge threshold when Claude backs it
+    result.shouldTrade = realEdge > minEdge && checksPassesd >= 3
+    result.reasoning.push("Claude directional call → relaxed thresholds (rare high-value signal)")
+  } else if (claudeSaidFair) {
+    // Claude says FAIR — no Smart Brain trade on this market
+    result.shouldTrade = false
+    result.reasoning.push("Claude says FAIR — no edge, skipping Smart Brain")
+  } else if (!usedClaude) {
+    // No Claude available — strict requirements
+    const minChecks = 5
+    const minEdge = 0.03
+    const minSignals = 3 // Need 3+ signals without AI backing
+    result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
+    if (!result.shouldTrade) {
+      result.reasoning.push("No AI backing — strict mode, need 5 checks + 3 signals")
     }
+  } else {
+    // Claude available but no clear direction and not FAIR (shouldn't happen often)
+    result.shouldTrade = checksPassesd >= 4 && realEdge > 0.03 && confirmingSignals >= 2
   }
 
   result.confidence = checksPassesd / totalChecks
@@ -553,8 +560,8 @@ export async function evaluateMarket(market, bankroll = 1000) {
       // Lesson penalty: if we've lost repeatedly on similar trades, reduce size
       const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
 
-      // Claude AI confidence boost: if Claude analyzed this market with high confidence, bet more
-      const aiBoost = usedClaude ? 1.3 : 1.0
+      // Claude AI confidence boost: directional call with confidence = bet bigger
+      const aiBoost = claudeHasDirection ? 1.5 : usedClaude ? 1.0 : 0.7 // No AI = smaller bet
 
       result.betSize = Math.min(
         deployable * 0.08, // Max 8% per trade (was 5% — too conservative)
