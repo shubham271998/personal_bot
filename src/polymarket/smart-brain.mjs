@@ -564,11 +564,25 @@ export async function evaluateMarket(market, bankroll = 1000) {
       const aiBoost = claudeHasDirection ? 1.5 : usedClaude ? 1.0 : 0.7 // No AI = smaller bet
 
       result.betSize = Math.min(
-        deployable * 0.08, // Max 8% per trade (was 5% — too conservative)
+        deployable * 0.08,
         kelly * 0.30 * deployable * stratWeight * timeMultiplier * categoryMultiplier * lessonPenalty * aiBoost,
       )
+
+      // SPORTS CAP: max $10 on any sports market — upsets happen, we can't afford -$60
+      const isSportsBrain = SNIPE_ONLY_CATEGORIES.has(category) || /\bvs\.?\b|win on 2026|o\/u|spread|handicap/i.test(question)
+      if (isSportsBrain) {
+        result.betSize = Math.min(result.betSize, 10) // Hard cap $10 on sports
+      }
+
+      // AI-backed non-sports: allow bigger bets (max $30)
+      if (!isSportsBrain && claudeHasDirection) {
+        result.betSize = Math.min(result.betSize, 30)
+      } else if (!isSportsBrain) {
+        result.betSize = Math.min(result.betSize, 15) // No AI backing = smaller
+      }
+
       result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100)
-      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)} (Kelly ${(kelly * 100).toFixed(1)}% × strat ${(stratWeight * 100).toFixed(0)}% × cat ${(categoryMultiplier * 100).toFixed(0)}% × lesson ${(lessonPenalty * 100).toFixed(0)}%)`)
+      result.reasoning.push(`Bet: $${result.betSize.toFixed(2)}${isSportsBrain ? ' [SPORTS CAP $10]' : ''} (Kelly ${(kelly * 100).toFixed(1)}% × AI ${(aiBoost * 100).toFixed(0)}%)`)
     }
   }
 
@@ -606,12 +620,18 @@ export async function smartScan(bankroll = 1000) {
 
   // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
   try {
-    const snipes = await strategyEngine.findResolutionSnipes(0.92, 0.99) // Widen range (was 0.93)
-    for (const snipe of snipes.slice(0, 12)) { // Find up to 12 snipes
-      // Don't duplicate if already approved by Smart Brain
+    const snipes = await strategyEngine.findResolutionSnipes(0.92, 0.99)
+    for (const snipe of snipes.slice(0, 12)) {
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
-      // Resolution snipes are PROVEN: 87% WR, +$28 profit. The money machine.
-      const betSize = Math.min(bankroll * 0.12, 60) // Up to 12% / $60 per snipe
+
+      // SPORTS CAP: anything can happen in sports — max $10 even on 95% snipes
+      // Bayern at 93% lost us -$60. Leverkusen at 93% lost us -$112.
+      // Sports upsets happen 15-20% of the time. Keep bets small.
+      const snipeCategory = detectCategory(snipe.market?.question || "")
+      const isSportsSnipe = SNIPE_ONLY_CATEGORIES.has(snipeCategory) || /\bvs\.?\b|win on 2026|o\/u|spread|handicap/i.test(snipe.market?.question || "")
+      const betSize = isSportsSnipe
+        ? Math.min(10, bankroll * 0.01) // Sports: MAX $10 (1% of bankroll)
+        : Math.min(bankroll * 0.06, 40) // Non-sports: up to $40 (reduced from $60)
       approved.push({
         market: snipe.market,
         shouldTrade: true,

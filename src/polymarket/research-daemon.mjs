@@ -27,8 +27,8 @@ const DB_PATH = path.join(DB_DIR, "bot.db")
 
 // ── Config ─────────────────────────────────────────────────
 const RESEARCH_INTERVAL_MS = 5 * 60 * 1000 // Research cycle every 5 min
-const MAX_MARKETS_PER_CYCLE = 12 // Analyze 12 per cycle — cover more markets
-const RESEARCH_TTL_HOURS = 4 // 4 hour TTL — balance freshness vs coverage
+const MAX_MARKETS_PER_CYCLE = 15 // Analyze 15 per cycle — maximize AI coverage
+const RESEARCH_TTL_HOURS = 6 // 6 hour TTL — keep more markets covered
 const CLAUDE_TIMEOUT_MS = 60000 // 60s per market analysis
 
 // ── DB Setup ───────────────────────────────────────────────
