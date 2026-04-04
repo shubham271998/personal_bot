@@ -26,10 +26,10 @@ const DB_DIR = process.env.DB_DIR || path.resolve(__dirname, "../../data")
 const DB_PATH = path.join(DB_DIR, "bot.db")
 
 // ── Config ─────────────────────────────────────────────────
-const RESEARCH_INTERVAL_MS = 5 * 60 * 1000 // Research cycle every 5 min
-const MAX_MARKETS_PER_CYCLE = 15 // Analyze 15 per cycle — maximize AI coverage
-const RESEARCH_TTL_HOURS = 6 // 6 hour TTL — keep more markets covered
-const CLAUDE_TIMEOUT_MS = 60000 // 60s per market analysis
+const RESEARCH_INTERVAL_MS = 2 * 60 * 1000 // Run every 2 min — continuous pipeline
+const MAX_MARKETS_PER_CYCLE = 5 // 5 markets per cycle (small batches, frequent runs)
+const RESEARCH_TTL_HOURS = 8 // 8 hour TTL — maximize coverage
+const CLAUDE_TIMEOUT_MS = 90000 // 90s for deep research
 
 // ── DB Setup ───────────────────────────────────────────────
 const db = new Database(DB_PATH)
@@ -205,21 +205,18 @@ function askClaudeDeep(prompt) {
 // ── Market analysis ────────────────────────────────────────
 
 /**
- * Decide research depth based on market characteristics
- * DEEP: geopolitical, politics, economics, crypto, high volume (>$50K)
- * QUICK: sports, entertainment, low volume
+ * Decide research depth
+ * DEEP: everything except pure sports matchups (deep research = web search = real intel)
+ * QUICK: only for live sports game outcomes (X vs Y, O/U, spreads)
  */
 function shouldDoDeepResearch(market, category) {
-  // Sports/esports: quick analysis (outcomes are unpredictable, research doesn't help much)
-  if (/\bvs\.?\b|win on 2026|o\/u|spread|handicap|esports|counter-strike|lol:/i.test(market.question || "")) return false
-  // High value markets: deep research
-  if (market.volume24hr > 50000) return true
-  // Non-sports categories: deep research
-  if (["geopolitical", "politics", "economics", "crypto"].includes(category)) return true
-  // Interesting odds (not near 0 or 100): deep research
-  const price = market.outcomes?.[0]?.price || 0.5
-  if (price > 0.15 && price < 0.85) return true
-  return false
+  const q = (market.question || "").toLowerCase()
+  // ONLY quick for live game outcomes — these can't be predicted by research
+  const isLiveGame = /\bvs\.?\b.*\d{4}|o\/u \d|spread:.*[+-]\d|handicap:.*[+-]/i.test(q)
+  const isEsportsGame = /counter-strike:|lol:|dota|valorant.*vs/i.test(q)
+  if (isLiveGame || isEsportsGame) return false
+  // Everything else gets deep research — web search finds real intel
+  return true
 }
 
 async function analyzeMarket(market, headlines, redditPosts = [], expertSummary = "") {
@@ -353,22 +350,24 @@ async function runResearchCycle() {
   // Fetch markets
   let markets
   try {
-    markets = await scanner.getTopMarkets(100)
+    markets = await scanner.getTopMarkets(200) // Scan more markets — research ALL of them over time
   } catch (err) {
     console.error("[RESEARCH] Failed to fetch markets:", err.message)
     return
   }
 
-  // Filter to interesting markets (not already resolved, good volume, interesting odds)
+  // Filter and prioritize: unresearched first, then expiring soon, then highest volume
   const interesting = markets.filter(m => {
     const p = m.outcomes?.[0]?.price || 0
     if (p <= 0.02 || p >= 0.98) return false // Already resolved
-    if (m.volume24hr < 5000) return false // Too illiquid
-    // Check if we already have fresh research
+    if (m.volume24hr < 2000) return false // Too illiquid (lowered from 5K to cover more)
     const existing = stmts.getValid.get(m.id)
-    if (existing) return false // Already researched and not expired
+    if (existing) return false
     return true
-  }).sort((a, b) => b.volume24hr - a.volume24hr).slice(0, MAX_MARKETS_PER_CYCLE)
+  }).sort((a, b) => {
+    // Priority: higher volume first
+    return b.volume24hr - a.volume24hr
+  }).slice(0, MAX_MARKETS_PER_CYCLE)
 
   console.log(`[RESEARCH] ${interesting.length} markets to analyze (${markets.length} total, ${stmts.count.get().c} cached)`)
 
@@ -376,32 +375,28 @@ async function runResearchCycle() {
   for (const market of interesting) {
     const category = brain.detectCategory(market.question)
 
-    // Gather ALL intelligence: headlines, Reddit, YouTube, expert tweets
+    // For DEEP research: Claude does its own web search — just pass basic context
+    // For QUICK: gather headlines + Reddit as input
+    const brain2 = await import("./smart-brain.mjs")
+    const cat = (brain2.default?.detectCategory || brain2.detectCategory)(market.question)
+    const isDeep = shouldDoDeepResearch(market, cat)
+
     let headlines = []
     let redditPosts = []
-    let expertSummary = ""
-    try {
-      const news = await newsAnalyzer.searchNews(market.question.slice(0, 40), 5)
-      headlines = news.map(h => h.title).filter(Boolean)
-    } catch {}
-    try {
-      const researcherMod = await import("./web-researcher.mjs")
-      redditPosts = await researcherMod.searchReddit(market.question.slice(0, 40), 3)
-    } catch {}
-    // Expert intelligence: YouTube transcripts + expert tweets (for high-value markets only)
-    if (market.volume24hr > 50000) {
+    if (!isDeep) {
+      // Quick analysis needs pre-gathered context
       try {
-        const expertIntel = await import("./expert-intel.mjs")
-        const intel = await expertIntel.gatherExpertIntel(market.question, category)
-        expertSummary = intel.summary || ""
-        if (intel.sources > 0) {
-          console.log(`[RESEARCH] Expert intel: ${intel.youtube.length} YT + ${intel.expertTweets.length} tweets for "${market.question.slice(0, 30)}"`)
-        }
+        const news = await newsAnalyzer.searchNews(market.question.slice(0, 40), 5)
+        headlines = news.map(h => h.title).filter(Boolean)
+      } catch {}
+      try {
+        const researcherMod = await import("./web-researcher.mjs")
+        redditPosts = await researcherMod.searchReddit(market.question.slice(0, 40), 3)
       } catch {}
     }
+    // Deep research: Claude CLI searches the web itself — no need for pre-gathered headlines
 
-    // Ask Claude CLI — deep research for high-value, quick for sports/low-value
-    const analysis = await analyzeMarket(market, headlines, redditPosts, expertSummary)
+    const analysis = await analyzeMarket(market, headlines, redditPosts, "")
     if (!analysis) continue
 
     // Store in local DB
