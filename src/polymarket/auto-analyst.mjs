@@ -568,8 +568,8 @@ const virtualStmts = {
 }
 
 const VIRTUAL_BANKROLL = 1000
-const VIRTUAL_MAX_BET = 60 // $60 max (sports $10 in Smart Brain)
-const VIRTUAL_MAX_OPEN = 120 // 120 open — deploy capital across many markets
+const VIRTUAL_MAX_BET = 25 // $25 max — small bets, many markets
+const VIRTUAL_MAX_OPEN = 150 // 150 positions — spread across entire market
 
 // ⚠️ NEVER DELETE DATA — the DB is the bot's memory and brain.
 // Every trade, prediction, lesson, and mistake is permanent.
@@ -1040,7 +1040,7 @@ async function runVirtualTradingCycle() {
     const brainScan = await smartBrain.smartScan(currentBalance)
     let tradesPlaced = 0
 
-    for (const pick of brainScan.approved.slice(0, 15)) {
+    for (const pick of brainScan.approved.slice(0, 25)) {
       if (openPositions.length + tradesPlaced >= VIRTUAL_MAX_OPEN) break
       if (!pick.market?.id) continue
       if (_tradedMarkets.has(pick.market.id)) continue
@@ -1114,7 +1114,7 @@ async function runVirtualTradingCycle() {
     }
 
     // 3. Record predictions from brain-approved picks (deduplicated)
-    for (const pick of brainScan.approved.slice(0, 15)) {
+    for (const pick of brainScan.approved.slice(0, 25)) {
       const mId = pick.market?.id
       if (!mId || !shouldPredict(mId)) continue
 
