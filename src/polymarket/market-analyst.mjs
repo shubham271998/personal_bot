@@ -70,6 +70,7 @@ export async function getCachedResearch(marketId) {
           probability: Number(row.ai_probability),
           confidence: row.ai_confidence,
           direction: row.ai_direction,
+          betPercentage: Number(row.ai_bet_pct || 0), // AI decides the amount
           reasoning: row.ai_reasoning,
           model: row.ai_model || "claude-cli",
           cached: true,
@@ -90,6 +91,7 @@ export async function getCachedResearch(marketId) {
       probability: row.ai_probability,
       confidence: row.ai_confidence,
       direction: row.ai_direction,
+      betPercentage: row.ai_bet_pct || 0,
       reasoning: row.ai_reasoning,
       model: row.ai_model || "claude-cli",
       cached: true,

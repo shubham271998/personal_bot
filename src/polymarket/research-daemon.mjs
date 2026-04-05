@@ -47,6 +47,7 @@ db.exec(`
     ai_direction   TEXT,
     ai_reasoning   TEXT,
     ai_headlines   TEXT,
+    ai_bet_pct     REAL DEFAULT 0,
     ai_model       TEXT DEFAULT 'claude-cli',
     researched_at  TEXT DEFAULT (datetime('now')),
     expires_at     TEXT
@@ -54,18 +55,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_research_expires ON pm_research(expires_at);
 `)
 
+// Migration
+try { db.exec(`ALTER TABLE pm_research ADD COLUMN ai_bet_pct REAL DEFAULT 0`) } catch {}
+
 const stmts = {
   upsert: db.prepare(`
     INSERT INTO pm_research (market_id, market_question, category, yes_price, volume_24h,
-      ai_probability, ai_confidence, ai_direction, ai_reasoning, ai_headlines, ai_model, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claude-cli', datetime('now', '+6 hours'))
+      ai_probability, ai_confidence, ai_direction, ai_reasoning, ai_headlines, ai_bet_pct, ai_model, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claude-cli', datetime('now', '+8 hours'))
     ON CONFLICT(market_id) DO UPDATE SET
       market_question=excluded.market_question, category=excluded.category,
       yes_price=excluded.yes_price, volume_24h=excluded.volume_24h,
       ai_probability=excluded.ai_probability, ai_confidence=excluded.ai_confidence,
       ai_direction=excluded.ai_direction, ai_reasoning=excluded.ai_reasoning,
-      ai_headlines=excluded.ai_headlines, researched_at=datetime('now'),
-      expires_at=datetime('now', '+6 hours')
+      ai_headlines=excluded.ai_headlines, ai_bet_pct=excluded.ai_bet_pct,
+      researched_at=datetime('now'), expires_at=datetime('now', '+8 hours')
   `),
   getValid: db.prepare(`SELECT * FROM pm_research WHERE market_id = ? AND expires_at > datetime('now')`),
   getAllValid: db.prepare(`SELECT * FROM pm_research WHERE expires_at > datetime('now') ORDER BY volume_24h DESC`),
@@ -238,31 +242,46 @@ async function analyzeMarket(market, headlines, redditPosts = [], expertSummary 
  * 30-90 seconds, uses WebSearch + WebFetch tools
  */
 async function analyzeDeep(market, question, yesPrice) {
-  const prompt = `You are a superforecaster and prediction market expert. Do DEEP research on this market.
+  const isSports = /\bvs\.?\b|win on 2026|o\/u|spread|handicap|esports|counter-strike|lol:/i.test(question)
+  const prompt = `You are a superforecaster, prediction market expert, and fund manager. Do DEEP research on this market and decide EXACTLY how to trade it.
 
 MARKET: "${question}"
 Current Polymarket price (YES): ${(yesPrice * 100).toFixed(1)}%
 24h Volume: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
+Category: ${isSports ? 'SPORTS (upsets common — be cautious)' : 'NON-SPORTS'}
 
 RESEARCH STEPS:
-1. Search the web for the LATEST news about this topic (use specific search queries)
-2. Read at least 2-3 news articles to understand the current situation
-3. Check what experts and analysts are saying
-4. Consider the base rate — how often do events like this actually happen?
-5. Compare what you found vs the market price — is there a real edge?
+1. Search the web for the LATEST news about this topic
+2. Read 2-3 articles to understand the current situation deeply
+3. Check expert opinions and analyst consensus
+4. Consider base rates — how often do events like this happen?
+5. Compare your probability vs market price — is there REAL edge?
+6. Decide: should we bet, how much, and in which direction?
 
-After your research, respond with ONLY this JSON block:
+YOUR BANKROLL: $${market._bankroll || 1500}. You manage this like real money.
+
+After research, respond with ONLY this JSON:
 \`\`\`json
-{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "3-4 sentences citing SPECIFIC facts, dates, and sources you found", "sources": ["source1", "source2"]}
+{"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "bet_percentage": X.X, "reasoning": "3-4 sentences with SPECIFIC evidence", "sources": ["source1", "source2"]}
 \`\`\`
+
+FIELD: bet_percentage = what % of bankroll to bet (0 to 5.0)
+- 0 = don't bet (FAIR or too risky)
+- 0.5 = tiny bet (low confidence, exploring)
+- 1.0 = small bet (moderate edge)
+- 2.0 = solid bet (clear edge + evidence)
+- 3.0 = strong bet (strong evidence, high confidence)
+- 5.0 = maximum conviction (rare — overwhelming evidence)
+${isSports ? '- SPORTS: max 0.7% regardless of confidence (upsets happen 20% of the time)' : ''}
 
 RULES:
 - Search for RECENT news (April 2026). Your knowledge may be outdated.
-- The market has thousands of traders. You need SPECIFIC NEW INFORMATION to disagree.
-- "Will X happen by date?" — status quo wins 80%+ of the time. Be skeptical.
-- War news on ceasefire market = ceasefire LESS likely, not more.
-- If your research doesn't find a clear edge, say FAIR.
-- Be SPECIFIC: cite article titles, dates, named officials, specific facts.`
+- Thousands of traders set this price. You need SPECIFIC evidence to disagree.
+- "Will X happen by date?" → status quo wins 80%+. Be skeptical.
+- War news ≠ ceasefire likely. Understand what the question ASKS.
+- FAIR = bet_percentage should be 0. Don't bet when you see no edge.
+- You lose money on wrong bets. Be honest about uncertainty.
+- Cite specific articles, dates, officials, facts.`
 
   try {
     console.log(`[RESEARCH] 🔬 Deep research: "${question.slice(0, 40)}"...`)
@@ -297,14 +316,17 @@ async function analyzeQuick(market, question, yesPrice, headlines = [], redditPo
     : ""
   const expertText = expertSummary ? `\n${expertSummary}` : ""
 
-  const prompt = `Prediction market analyst. Quick analysis:
+  const isSports = /\bvs\.?\b|win on 2026|o\/u|spread|handicap|esports|counter-strike|lol:/i.test(question)
+  const prompt = `Prediction market analyst + fund manager. Quick analysis:
 
 MARKET: "${question}"
 YES price: ${(yesPrice * 100).toFixed(1)}% | Vol: $${((market.volume24hr || 0) / 1000).toFixed(0)}K
+Bankroll: $${market._bankroll || 1500} | ${isSports ? 'SPORTS (max 0.7% bet)' : 'NON-SPORTS'}
 ${headlineText}${redditText}${expertText}
 
-JSON only: {"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "reasoning": "1-2 sentences"}
-Rules: rarely deviate >10% from market. Status quo wins. If unsure = FAIR.`
+JSON only: {"probability": 0.XX, "confidence": "low/medium/high", "direction": "YES/NO/FAIR", "bet_percentage": X.X, "reasoning": "1-2 sentences"}
+bet_percentage: 0=no bet, 0.5=tiny, 1.0=small, 2.0=solid, 3.0=strong, 5.0=max conviction.
+${isSports ? 'Sports max 0.7%.' : ''} FAIR = bet_percentage 0. Rarely deviate >10% from market.`
 
   try {
     const response = await askClaudeQuick(prompt)
@@ -323,9 +345,10 @@ function formatAnalysis(analysis, yesPrice, mode) {
     probability: Math.max(0.01, Math.min(0.99, parseFloat(analysis.probability) || yesPrice)),
     confidence: analysis.confidence || "low",
     direction: analysis.direction || "FAIR",
-    reasoning: (analysis.reasoning || "").slice(0, 800), // More room for deep research
+    betPercentage: Math.max(0, Math.min(5, parseFloat(analysis.bet_percentage) || 0)), // AI decides the amount
+    reasoning: (analysis.reasoning || "").slice(0, 800),
     sources: analysis.sources || [],
-    mode, // "deep" or "quick"
+    mode,
   }
 }
 
@@ -369,10 +392,18 @@ async function runResearchCycle() {
     return b.volume24hr - a.volume24hr
   }).slice(0, MAX_MARKETS_PER_CYCLE)
 
-  console.log(`[RESEARCH] ${interesting.length} markets to analyze (${markets.length} total, ${stmts.count.get().c} cached)`)
+  // Get current balance for bet sizing context
+  let currentBankroll = 1500
+  try {
+    const pnlRow = db.prepare("SELECT COALESCE(SUM(pnl),0) as p FROM pm_virtual_portfolio WHERE status='closed'").get()
+    currentBankroll = 1000 + (pnlRow?.p || 0)
+  } catch {}
+
+  console.log(`[RESEARCH] ${interesting.length} markets to analyze (${markets.length} total, ${stmts.count.get().c} cached, bankroll: $${currentBankroll.toFixed(0)})`)
 
   let analyzed = 0
   for (const market of interesting) {
+    market._bankroll = currentBankroll // Pass to analysis prompt
     const category = brain.detectCategory(market.question)
 
     // For DEEP research: Claude does its own web search — just pass basic context
@@ -405,6 +436,7 @@ async function runResearchCycle() {
       market.outcomes?.[0]?.price || 0, market.volume24hr || 0,
       analysis.probability, analysis.confidence, analysis.direction,
       analysis.reasoning, JSON.stringify((analysis.sources || headlines.map(h=>h.title || h)).slice(0, 5)),
+      analysis.betPercentage || 0,
     )
 
     analyzed++

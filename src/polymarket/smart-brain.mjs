@@ -391,6 +391,10 @@ export async function evaluateMarket(market, bankroll = 1000) {
           estimatedProb = claudeProb * blendWeight + yesPrice * (1 - blendWeight)
           result.reasoning.push(`🧠 Claude: ${claudeDirection} ${(claudeProb * 100).toFixed(0)}% (${analysis.confidence}) — ${analysis.reasoning}`)
           result.reasoning.push(`Blend: ${(blendWeight * 100).toFixed(0)}% Claude + ${((1 - blendWeight) * 100).toFixed(0)}% market → ${(estimatedProb * 100).toFixed(1)}%`)
+          // Capture AI's bet sizing decision
+          if (analysis.betPercentage > 0) {
+            result._aiBetPercentage = analysis.betPercentage
+          }
         }
       }
     } catch (err) {
@@ -557,13 +561,17 @@ export async function evaluateMarket(market, bankroll = 1000) {
       // At $1,487: deployable = $1,264
       const deployable = bankroll * 0.85
 
-      // SPREAD WIDE, BET SMALL — more markets, smaller bets, let AI find edge
+      // AI DECIDES THE AMOUNT — Claude analyzed the market and chose bet_percentage
+      // This replaces all hardcoded sizing logic with AI judgment
       let baseBet
-      if (realEdge > 0.10 && usedClaude) {
-        baseBet = deployable * 0.025 // 2.5% max even on best edge
-        result.reasoning.push(`HIGH EDGE ${(realEdge * 100).toFixed(0)}% + AI → small precise bet`)
-      } else if (realEdge > 0.05 && usedClaude) {
-        baseBet = deployable * 0.02
+      const aiBetPct = result._aiBetPercentage || 0 // Set during Claude analysis phase
+
+      if (aiBetPct > 0) {
+        // Claude explicitly decided the bet size — trust it
+        baseBet = deployable * (aiBetPct / 100)
+        result.reasoning.push(`🧠 AI sizing: ${aiBetPct.toFixed(1)}% of \$${bankroll.toFixed(0)} = \$${baseBet.toFixed(0)}`)
+      } else if (realEdge > 0.10 && usedClaude) {
+        baseBet = deployable * 0.025 // Fallback: 2.5% on high edge
       } else if (realEdge > 0.05) {
         baseBet = deployable * 0.015
       } else {
@@ -688,16 +696,18 @@ export async function smartScan(bankroll = 1000) {
         const direction = research.direction === "YES" ? "BUY_YES" : "BUY_NO"
         const outcome = direction === "BUY_YES" ? market.outcomes[0]?.name : market.outcomes[1]?.name || "No"
 
-        // AI Signal — small precise bets, let AI research prove itself across many markets
+        // AI Signal — Claude decides the bet amount
         let betSize
-        if (edge > 0.15 && research.confidence === "high") {
-          betSize = bankroll * 0.02 // 2% even on best edge
+        const aiBetPct = research.betPercentage || 0
+        if (aiBetPct > 0) {
+          // Claude explicitly chose the sizing
+          betSize = bankroll * (aiBetPct / 100)
         } else if (edge > 0.10) {
-          betSize = bankroll * 0.015
+          betSize = bankroll * 0.015 // Fallback
         } else {
           betSize = bankroll * 0.01
         }
-        betSize = Math.min(betSize, 25) // Max $25
+        betSize = Math.min(betSize, 40) // Max $40
         if (isSports) betSize = Math.min(betSize, 8)
 
         approved.push({
