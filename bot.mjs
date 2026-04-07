@@ -272,13 +272,23 @@ if (ownerChatId && IS_TRADING_BOT) {
       const health = await pmApiClient.healthCheck()
       console.log(`[PM] API health: ${health.ok ? "✅ connected" : "❌ " + health.error}`)
 
-      liveMonitor.start(1000)
+      // Compute actual bankroll from PnL instead of hardcoded $1000
+      let startingBankroll = 1000
+      try {
+        const pnlRow = db.raw.prepare("SELECT COALESCE(SUM(pnl),0) as p FROM pm_virtual_portfolio WHERE status='closed'").get()
+        startingBankroll = 1000 + (pnlRow?.p || 0)
+        console.log(`[PM] Computed bankroll from PnL: $${startingBankroll.toFixed(2)}`)
+      } catch (e) {
+        console.error("[PM] Could not compute bankroll, using $1000:", e.message)
+      }
+
+      liveMonitor.start(startingBankroll)
       autoAnalyst.startAutonomous()
       priceMonitor.connect() // Real-time BTC/ETH/SOL from Binance
-      console.log("[PM] Auto-started: monitor + analyst + virtual trading + price feed ($1000 bankroll)")
+      console.log(`[PM] Auto-started: monitor + analyst + virtual trading + price feed ($${startingBankroll.toFixed(0)} bankroll)`)
       bot.sendMessage(ownerChatId,
         `☁️ *Trading Bot Online*\n\n` +
-          `Auto-started with $1000 virtual bankroll.\n` +
+          `Auto-started with $${startingBankroll.toFixed(0)} virtual bankroll (compounded from PnL).\n` +
           `Scanning, trading, and learning 24/7.\n\n` +
           `/pmscorecard — virtual P&L\n` +
           `/pmbrain — my thinking\n` +

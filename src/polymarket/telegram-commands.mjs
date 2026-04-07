@@ -11,6 +11,7 @@ import strategyEngine from "./strategy-engine.mjs"
 import marketMaker from "./market-maker.mjs"
 import executor from "./executor-bridge.mjs"
 import negRisk from "./negrisk-scanner.mjs"
+import realTrader from "./real-trader.mjs"
 
 // Safe Telegram message helpers — fall back to plain text if markdown breaks
 async function safeEdit(bot, chatId, msgId, text) {
@@ -675,5 +676,171 @@ export function registerPolymarketCommands(bot, isAdminFn) {
     } catch (err) {
       safeEdit(bot, chatId, loading.message_id, `Failed: ${err.message}`)
     }
+  })
+
+  // ══════════════════════════════════════════════════════════
+  // REAL MONEY COMMANDS
+  // ══════════════════════════════════════════════════════════
+
+  // /pmreset — Close ALL open virtual positions and start fresh with new formula
+  bot.onText(/\/pmreset\s*(confirm)?/, async (msg, match) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) { bot.sendMessage(chatId, "Admin only."); return }
+
+    if (match[1] !== "confirm") {
+      bot.sendMessage(chatId,
+        `⚠️ This will close ALL open virtual positions at current price and clear the dedup set.\n\n` +
+        `New trades will use the updated formula with:\n` +
+        `• Realistic slippage (0.5-1%)\n` +
+        `• Entry fees (30% taker mix)\n` +
+        `• Exit fees on non-resolution closes\n\n` +
+        `Type \`/pmreset confirm\` to proceed.`,
+        { parse_mode: "Markdown" },
+      )
+      return
+    }
+
+    try {
+      const db = (await import("../database.mjs")).default
+      const open = db.raw.prepare("SELECT COUNT(*) as c FROM pm_virtual_portfolio WHERE status='open'").get()
+
+      db.raw.prepare(`
+        UPDATE pm_virtual_portfolio
+        SET status='closed', exit_price=entry_price, pnl=0, close_reason='fresh-start-v2', exit_fee=0, closed_at=datetime('now')
+        WHERE status='open'
+      `).run()
+
+      bot.sendMessage(chatId,
+        `✅ *Reset Complete*\n\n` +
+        `Closed ${open.c} positions at entry price (0 P&L).\n` +
+        `New trades will include realistic fees + slippage.\n\n` +
+        `Bot will open new positions in the next scan cycle (2 min).`,
+        { parse_mode: "Markdown" },
+      )
+    } catch (err) {
+      bot.sendMessage(chatId, `Failed: ${err.message}`)
+    }
+  })
+
+  // /pmgoreal — Enable real money trading
+  bot.onText(/\/pmgoreal/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) { bot.sendMessage(chatId, "Admin only."); return }
+
+    const wallet = await realTrader.getWalletState(chatId)
+    if (!wallet.connected) {
+      bot.sendMessage(chatId, "❌ No wallet connected. Use `/pmconnect <private_key>` first.", { parse_mode: "Markdown" })
+      return
+    }
+
+    if (!wallet.hasGas) {
+      bot.sendMessage(chatId, `❌ Need MATIC for gas. Address: \`${wallet.address}\`\nSend 0.1 MATIC on Polygon.`, { parse_mode: "Markdown" })
+      return
+    }
+
+    if (!wallet.approvedCTF || !wallet.approvedNegRisk) {
+      bot.sendMessage(chatId, "⏳ Approving USDC for trading contracts...")
+      const approval = await realTrader.approveExchanges(chatId)
+      if (!approval.ok) {
+        bot.sendMessage(chatId, `❌ Approval failed: ${approval.error}`)
+        return
+      }
+    }
+
+    realTrader.enableRealMode()
+
+    bot.sendMessage(chatId,
+      `💰 *REAL MONEY MODE ACTIVATED*\n\n` +
+      `*Wallet:* \`${wallet.address}\`\n` +
+      `*Balance:* $${wallet.usdc.toFixed(2)} USDC\n` +
+      `*Floor:* $${realTrader.FLOOR_BALANCE} (never go below)\n` +
+      `*Gas:* ${wallet.matic.toFixed(4)} MATIC ✅\n\n` +
+      `*Strategy Phase:* ${wallet.usdc >= 1200 ? "🚀 FULL" : wallet.usdc >= 800 ? "💡 +Smart Brain" : wallet.usdc >= 600 ? "🧠 +AI Signal" : "🛡️ Safe Only"}\n\n` +
+      `*Safety:*\n` +
+      `• Max $${25} per trade (5% of balance)\n` +
+      `• Max $${30} daily loss → auto-halt\n` +
+      `• Only LIMIT orders (0% maker fee)\n` +
+      `• Stale orders cancelled after 5 min\n` +
+      `• Strategies unlock as balance grows\n\n` +
+      `Virtual trading continues in parallel for comparison.\n` +
+      `Use /pmpause to pause real trading.`,
+      { parse_mode: "Markdown" },
+    )
+  })
+
+  // /pmpause — Pause real money trading
+  bot.onText(/\/pmpause/, (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+    realTrader.disableRealMode()
+    bot.sendMessage(chatId, "🔴 Real money trading PAUSED. Virtual continues.\nUse /pmgoreal to resume.")
+  })
+
+  // /pmrealstats — Real money scorecard
+  bot.onText(/\/pmrealstats/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    const wallet = await realTrader.getWalletState(chatId)
+    if (!wallet.connected) {
+      bot.sendMessage(chatId, "No wallet connected.")
+      return
+    }
+
+    const scorecard = realTrader.generateScorecard(wallet)
+    bot.sendMessage(chatId, scorecard, { parse_mode: "Markdown" })
+  })
+
+  // /pmwallet — Detailed wallet info
+  bot.onText(/\/pmwallet$/, async (msg) => {
+    const chatId = msg.chat.id
+    if (!isAdminFn(msg.from.id)) return
+
+    const wallet = await realTrader.getWalletState(chatId)
+    if (!wallet.connected) {
+      bot.sendMessage(chatId, "No wallet connected. Use `/pmconnect <key>`", { parse_mode: "Markdown" })
+      return
+    }
+
+    const mode = realTrader.isRealMode() ? "💰 REAL" : "📝 Paper"
+    bot.sendMessage(chatId,
+      `*Wallet Info*\n\n` +
+      `Address: \`${wallet.address}\`\n` +
+      `USDC: $${wallet.usdc.toFixed(2)}\n` +
+      `MATIC: ${wallet.matic.toFixed(4)}\n` +
+      `Mode: ${mode}\n\n` +
+      `CTF Approved: ${wallet.approvedCTF ? "✅" : "❌"}\n` +
+      `NegRisk Approved: ${wallet.approvedNegRisk ? "✅" : "❌"}\n\n` +
+      `Open: ${wallet.openPositions} positions ($${wallet.openValue})\n` +
+      `Available: $${wallet.availableBalance}\n` +
+      `Realized P&L: ${wallet.realizedPnL >= 0 ? "+" : ""}$${wallet.realizedPnL}\n` +
+      `Total Fees: $${wallet.totalFees}`,
+      { parse_mode: "Markdown" },
+    )
+  })
+
+  // /pmfees <amount> <price> <category> — Calculate fees for a trade
+  bot.onText(/\/pmfees\s+([\d.]+)\s+([\d.]+)\s*(\w*)/, (msg, match) => {
+    const chatId = msg.chat.id
+    const amount = parseFloat(match[1])
+    const price = parseFloat(match[2])
+    const category = match[3] || "other"
+
+    const takerFee = realTrader.calculateTakerFee(amount, price, category)
+    const viability = realTrader.isTradeViable(amount, price, 1.0, category, true)
+
+    bot.sendMessage(chatId,
+      `*Fee Calculator*\n\n` +
+      `Trade: $${amount} at ${(price * 100).toFixed(1)}%\n` +
+      `Category: ${category}\n\n` +
+      `*Taker fee:* $${takerFee.fee.toFixed(4)} (${takerFee.feePct}%)\n` +
+      `*Maker fee:* $0.00 (0%) ← we use this\n\n` +
+      `*If resolves at $1:*\n` +
+      `  Gross: $${viability.grossProfit.toFixed(2)}\n` +
+      `  Net (maker entry): $${viability.netProfit.toFixed(2)}\n` +
+      `  Return: ${viability.returnPct}%\n` +
+      `  ${viability.profitable ? "✅ Profitable" : "❌ Not viable"}`,
+      { parse_mode: "Markdown" },
+    )
   })
 }

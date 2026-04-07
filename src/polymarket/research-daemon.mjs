@@ -27,8 +27,9 @@ const DB_PATH = path.join(DB_DIR, "bot.db")
 
 // ── Config ─────────────────────────────────────────────────
 const RESEARCH_INTERVAL_MS = 2 * 60 * 1000 // Run every 2 min — continuous pipeline
-const MAX_MARKETS_PER_CYCLE = 5 // 5 markets per cycle (small batches, frequent runs)
-const RESEARCH_TTL_HOURS = 8 // 8 hour TTL — maximize coverage
+const MAX_MARKETS_PER_CYCLE = 10 // Doubled from 5 — need better coverage (was 34.5%)
+const RESEARCH_TTL_HOURS = 6 // Reduced from 8 — stale research = bad trades
+const FAST_CATEGORY_TTL_HOURS = 3 // Sports, crypto move fast — shorter TTL
 const CLAUDE_TIMEOUT_MS = 90000 // 90s for deep research
 
 // ── DB Setup ───────────────────────────────────────────────
@@ -62,14 +63,14 @@ const stmts = {
   upsert: db.prepare(`
     INSERT INTO pm_research (market_id, market_question, category, yes_price, volume_24h,
       ai_probability, ai_confidence, ai_direction, ai_reasoning, ai_headlines, ai_bet_pct, ai_model, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claude-cli', datetime('now', '+8 hours'))
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claude-cli', datetime('now', '+' || ? || ' hours'))
     ON CONFLICT(market_id) DO UPDATE SET
       market_question=excluded.market_question, category=excluded.category,
       yes_price=excluded.yes_price, volume_24h=excluded.volume_24h,
       ai_probability=excluded.ai_probability, ai_confidence=excluded.ai_confidence,
       ai_direction=excluded.ai_direction, ai_reasoning=excluded.ai_reasoning,
       ai_headlines=excluded.ai_headlines, ai_bet_pct=excluded.ai_bet_pct,
-      researched_at=datetime('now'), expires_at=datetime('now', '+8 hours')
+      researched_at=datetime('now'), expires_at=datetime('now', '+' || ? || ' hours')
   `),
   getValid: db.prepare(`SELECT * FROM pm_research WHERE market_id = ? AND expires_at > datetime('now')`),
   getAllValid: db.prepare(`SELECT * FROM pm_research WHERE expires_at > datetime('now') ORDER BY volume_24h DESC`),
@@ -379,16 +380,21 @@ async function runResearchCycle() {
     return
   }
 
-  // Filter and prioritize: unresearched first, then expiring soon, then highest volume
-  const interesting = markets.filter(m => {
+  // Filter and prioritize: unresearched, sweet-spot volume, skip obvious snipes
+  const interesting = markets.filter((m) => {
     const p = m.outcomes?.[0]?.price || 0
     if (p <= 0.02 || p >= 0.98) return false // Already resolved
-    if (m.volume24hr < 2000) return false // Too illiquid (lowered from 5K to cover more)
+    if (m.volume24hr < 2000) return false // Too illiquid
+    // Skip markets at 93%+ in politics — these are just snipe targets, no research needed
+    if (p >= 0.93 && /election|president|congress|senat/i.test(m.question || "")) return false
     const existing = stmts.getValid.get(m.id)
     if (existing) return false
     return true
   }).sort((a, b) => {
-    // Priority: higher volume first
+    // Priority: sweet spot ($10K-$100K) first, then by volume
+    const aSweet = a.volume24hr >= 10000 && a.volume24hr <= 100000 ? 1 : 0
+    const bSweet = b.volume24hr >= 10000 && b.volume24hr <= 100000 ? 1 : 0
+    if (aSweet !== bSweet) return bSweet - aSweet // Sweet spot first
     return b.volume24hr - a.volume24hr
   }).slice(0, MAX_MARKETS_PER_CYCLE)
 
@@ -430,13 +436,16 @@ async function runResearchCycle() {
     const analysis = await analyzeMarket(market, headlines, redditPosts, "")
     if (!analysis) continue
 
-    // Store in local DB
+    // Store in local DB — fast-moving categories get shorter TTL
+    const FAST_CATS = new Set(["sports", "crypto"])
+    const ttlHours = FAST_CATS.has(category) ? FAST_CATEGORY_TTL_HOURS : RESEARCH_TTL_HOURS
     stmts.upsert.run(
       market.id, market.question?.slice(0, 200), category,
       market.outcomes?.[0]?.price || 0, market.volume24hr || 0,
       analysis.probability, analysis.confidence, analysis.direction,
-      analysis.reasoning, JSON.stringify((analysis.sources || headlines.map(h=>h.title || h)).slice(0, 5)),
+      analysis.reasoning, JSON.stringify((analysis.sources || headlines.map((h) => h.title || h)).slice(0, 5)),
       analysis.betPercentage || 0,
+      ttlHours, ttlHours, // Two params for INSERT and UPDATE expires_at
     )
 
     analyzed++

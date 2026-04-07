@@ -22,6 +22,10 @@ import researcher from "./web-researcher.mjs"
 import analyst from "./market-analyst.mjs"
 import whaleTracker from "./whale-tracker.mjs"
 
+// Dead zone: 51-67% price range is where most losses cluster
+const DEAD_ZONE_MIN = 0.51
+const DEAD_ZONE_MAX = 0.67
+
 // ── Constants from research ─────────────────────────────────
 
 // Minimum edge after fees to justify a trade (research: 5-7% needed)
@@ -234,6 +238,13 @@ export async function evaluateMarket(market, bankroll = 1000) {
     result.reasoning.push(`Uncategorized market — proceeding cautiously`)
   }
 
+  // ── Check 0.5: Dead zone — 51-67% is where most losses cluster ──
+  if (yesPrice >= DEAD_ZONE_MIN && yesPrice <= DEAD_ZONE_MAX) {
+    result.reasoning.push(`Dead zone (${(yesPrice * 100).toFixed(0)}%) — 51-67% range loses money. Skip.`)
+    result.checksDetail = { ...result.checks }
+    return result
+  }
+
   // ── Check 1: Price range safety (learned from past) ────────
   if (!adaptiveLearner.isPriceRangeSafe(yesPrice)) {
     result.reasoning.push(`Price range ${(yesPrice * 100).toFixed(0)}% disabled by adaptive learner — skip`)
@@ -346,7 +357,7 @@ export async function evaluateMarket(market, bankroll = 1000) {
   // ── Run research ONLY if cheap checks look promising ────────
   const cheapChecksPassed = [result.checks.categoryCheck, result.checks.priceRangeCheck,
     result.checks.efficiencyCheck, result.checks.biasCheck, result.checks.historyCheck].filter(Boolean).length
-  if (cheapChecksPassed >= 3) {
+  if (cheapChecksPassed >= 4) { // Raised from 3 — don't waste research on weak setups
     try {
       research = await researcher.researchMarket(market, category)
     } catch {}
@@ -503,13 +514,13 @@ export async function evaluateMarket(market, bankroll = 1000) {
     result.shouldTrade = false
     result.reasoning.push("Claude says FAIR — no edge, skipping Smart Brain")
   } else if (!usedClaude) {
-    // No Claude available — strict requirements
-    const minChecks = 5
-    const minEdge = 0.03
-    const minSignals = 3 // Need 3+ signals without AI backing
+    // No Claude available — strict requirements (raised from 5→6 checks, need strong setup)
+    const minChecks = 6
+    const minEdge = 0.04
+    const minSignals = 3
     result.shouldTrade = checksPassesd >= minChecks && realEdge > minEdge && confirmingSignals >= minSignals
     if (!result.shouldTrade) {
-      result.reasoning.push("No AI backing — strict mode, need 5 checks + 3 signals")
+      result.reasoning.push("No AI backing — strict mode, need 6 checks + 3 signals + 4% edge")
     }
   } else {
     // Claude available but no clear direction and not FAIR (shouldn't happen often)
@@ -587,6 +598,10 @@ export async function evaluateMarket(market, bankroll = 1000) {
       const lessonPenalty = adaptiveLearner.getLessonPenalty("Smart Brain", yesPrice)
       baseBet *= lessonPenalty
 
+      // Category confidence — scale bets by how well we trade this category
+      const categoryConf = adaptiveLearner.getCategoryConfidence(category)
+      baseBet *= categoryConf
+
       // SPORTS: hard cap $10
       if (isSportsBrain) {
         result.betSize = Math.min(baseBet, 10)
@@ -595,8 +610,8 @@ export async function evaluateMarket(market, bankroll = 1000) {
         result.betSize = Math.min(baseBet, 25)
       }
 
-      // Floor: minimum $8 (data shows tiny bets lose money, $10-25 range is profitable)
-      result.betSize = Math.max(8, Math.round(result.betSize * 100) / 100)
+      // Floor: $3 minimum — removed $8 floor that was forcing bad trades
+      result.betSize = Math.max(3, Math.round(result.betSize * 100) / 100)
 
       result.reasoning.push(`Bet: $${result.betSize.toFixed(2)}${isSportsBrain ? ' [SPORTS $10]' : ''} (edge:${(realEdge * 100).toFixed(0)}% bankroll:$${bankroll.toFixed(0)} → ${(result.betSize/bankroll*100).toFixed(1)}%)`)
     }
@@ -637,18 +652,18 @@ export async function smartScan(bankroll = 1000) {
   }
 
   // 2. Safe strategies: Resolution Snipes (low risk, guaranteed small profit)
+  // Boosted: lower threshold to 88%, more snipes (50), bigger bets
   try {
-    const snipes = await strategyEngine.findResolutionSnipes(0.91, 0.99) // Wider range
-    for (const snipe of snipes.slice(0, 30)) { // Many small snipes across markets
+    const snipes = await strategyEngine.findResolutionSnipes(0.88, 0.99) // Widened from 91%
+    for (const snipe of snipes.slice(0, 50)) { // Increased from 30 — these are near-guaranteed
       if (approved.some(a => a.market?.id === snipe.market?.id)) continue
 
-      // Snipe sizing — scales with bankroll for compound growth
+      // Snipe sizing — boosted because 93.9% win rate proves these work
       const snipeCategory = detectCategory(snipe.market?.question || "")
       const isSportsSnipe = SNIPE_ONLY_CATEGORIES.has(snipeCategory) || /\bvs\.?\b|win on 2026|o\/u|spread|handicap/i.test(snipe.market?.question || "")
-      // Small snipe bets across MANY markets — spread wide
       const betSize = isSportsSnipe
-        ? Math.min(8, bankroll * 0.006) // Sports: $8 max
-        : Math.min(bankroll * 0.015, 20) // Non-sports snipe: 1.5%, max $20
+        ? Math.min(12, bankroll * 0.008) // Sports: $12 max (was $8)
+        : Math.min(bankroll * 0.025, 35) // Non-sports snipe: 2.5%, max $35 (was $20)
       approved.push({
         market: snipe.market,
         shouldTrade: true,
@@ -667,6 +682,40 @@ export async function smartScan(bankroll = 1000) {
     }
   } catch (err) {
     console.error("[BRAIN] Snipe scan failed:", err.message)
+  }
+
+  // 2.5. Time-Decay Sniping — markets 2-6h from resolution at 85-92%
+  // Not quite in snipe range but very likely to resolve — exploitable stale prices
+  try {
+    const decaySnipes = await strategyEngine.findResolutionSnipes(0.85, 0.92)
+    for (const snipe of decaySnipes.slice(0, 20)) {
+      if (approved.some(a => a.market?.id === snipe.market?.id)) continue
+      const hoursLeft = snipe.hoursLeft !== "N/A" ? parseFloat(snipe.hoursLeft) : Infinity
+      if (hoursLeft > 6 || hoursLeft < 0) continue // Only 0-6 hours from resolution
+
+      const snipeCategory = detectCategory(snipe.market?.question || "")
+      const isSportsDecay = SNIPE_ONLY_CATEGORIES.has(snipeCategory)
+      const betSize = isSportsDecay
+        ? Math.min(8, bankroll * 0.005)
+        : Math.min(bankroll * 0.015, 20)
+      approved.push({
+        market: snipe.market,
+        shouldTrade: true,
+        direction: "BUY_YES",
+        outcome: snipe.outcome,
+        confidence: 0.8,
+        estimatedProb: snipe.price + 0.03,
+        realEdge: (1 - snipe.price) - TOTAL_COST_PCT,
+        betSize,
+        reasoning: [snipe.reasoning, `Time-decay: ${hoursLeft.toFixed(0)}h left, ${snipe.profit}% profit`],
+        score: parseFloat(snipe.profit) * 1.5 * (6 / Math.max(hoursLeft, 0.5)), // Higher score for closer to resolution
+        category: "time_decay",
+        strategy: "Time Decay Snipe",
+        checksDetail: { safeStrategy: true, hoursLeft },
+      })
+    }
+  } catch (err) {
+    console.error("[BRAIN] Time-decay scan failed:", err.message)
   }
 
   // 3. AI Signal Trades — directly trade Claude's YES/NO directional calls
@@ -758,7 +807,7 @@ export async function smartScan(bankroll = 1000) {
   }
 
   console.log(
-    `[BRAIN] Scanned ${markets.length} markets: ${approved.length} approved (${approved.filter(a => a.strategy === "Smart Brain").length} brain + ${approved.filter(a => a.strategy === "Resolution Snipe").length} snipes + ${approved.filter(a => a.strategy === "Arbitrage").length} arb), ${skipped} skipped`,
+    `[BRAIN] Scanned ${markets.length} markets: ${approved.length} approved (${approved.filter((a) => a.strategy === "Smart Brain").length} brain + ${approved.filter((a) => a.strategy === "Resolution Snipe").length} snipes + ${approved.filter((a) => a.strategy === "Time Decay Snipe").length} decay + ${approved.filter((a) => a.strategy === "AI Signal").length} ai + ${approved.filter((a) => a.strategy === "Arbitrage").length} arb), ${skipped} skipped`,
   )
 
   return {

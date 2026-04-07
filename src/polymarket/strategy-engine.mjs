@@ -352,14 +352,13 @@ export async function runFullScan(bankroll = 100) {
     allocation: { safe: 0.6, medium: 0.25, highRisk: 0.15 },
   }
 
-  // Run all strategies in parallel
-  const [snipes, arbs, negRiskArbs, newsAlpha, momentum, longShots] = await Promise.allSettled([
+  // Run all strategies in parallel — Long Shots REMOVED (0/6 wins, -$32.67, grade F)
+  const [snipes, arbs, negRiskArbs, newsAlpha, momentum] = await Promise.allSettled([
     findResolutionSnipes(),
     findArbitrage(),
     negRiskScanner.findNegRiskArbitrage(1.0),
     findNewsAlpha(15),
     findMomentum(),
-    findLongShots(),
   ])
 
   // Collect results
@@ -407,13 +406,7 @@ export async function runFullScan(bankroll = 100) {
     }
   }
 
-  if (longShots.status === "fulfilled") {
-    results.strategies.longShots = longShots.value.length
-    for (const t of longShots.value.slice(0, 3)) {
-      t.betSize = Math.min(bankroll * 0.03, 5) // Small bets on long shots
-      allTrades.push(t)
-    }
-  }
+  // Long Shots REMOVED — 0% win rate, longshot bias confirmed by data
 
   // Sort by score and take top picks
   allTrades.sort((a, b) => b.score - a.score)

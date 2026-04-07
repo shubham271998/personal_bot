@@ -49,14 +49,15 @@ db.raw.exec(`
 
 // Initialize default strategy weights
 const DEFAULT_STRATEGIES = {
-  "Resolution Snipe": 1.5,    // Start high — safest strategy
+  "Resolution Snipe": 1.5,    // Start high — safest strategy (93.9% WR proven)
+  "Time Decay Snipe": 1.3,    // NEW: near-resolution 85-92% markets
   "AI Signal": 1.2,           // Claude-backed directional trades — high trust
   "NegRisk Arbitrage": 1.5,   // Risk-free
   "Arbitrage": 1.5,           // Risk-free
   "News Alpha": 0.8,          // Medium confidence
   "Momentum": 0.6,            // Lower confidence
   "Smart Brain": 0.5,         // Needs AI backing to be good
-  "Long Shot": 0.3,           // Start low — most risky
+  // Long Shot REMOVED — 0/6 wins, -$32.67, grade F. Longshot bias is real.
 }
 
 // Initialize price range stats

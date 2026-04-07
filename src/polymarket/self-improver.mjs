@@ -204,8 +204,14 @@ export function getStrategyAdvice() {
     advice += `• ${worst.strategy} is losing money — I should reduce or stop\n`
   }
 
-  // Record lesson
-  recordLesson("strategy_review", `Best: ${best.strategy} (${best.grade}), Worst: ${worst.strategy} (${worst.grade})`)
+  // Record lesson — only if grades changed (prevents spam: was writing every 15 min)
+  const lastReview = db.raw.prepare(
+    `SELECT lesson FROM pm_lessons WHERE lesson_type = 'strategy_review' ORDER BY id DESC LIMIT 1`
+  ).get()
+  const newLesson = `Best: ${best.strategy} (${best.grade}), Worst: ${worst.strategy} (${worst.grade})`
+  if (!lastReview || lastReview.lesson !== newLesson) {
+    recordLesson("strategy_review", newLesson)
+  }
 
   return advice
 }
@@ -418,15 +424,23 @@ export function generateImprovementReport() {
     calibInsight = "My calibration looks good — predictions match reality."
   }
 
-  // Save Brier score
+  // Save Brier score — only if value actually changed (prevents spam)
   const period = new Date().toISOString().split("T")[0]
-  db.raw.prepare(`
-    INSERT INTO pm_brier_scores (period, brier_score, calibration, resolution, total_preds, correct)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(period, brier.brierScore, brier.calibration, brier.resolution, predictions.length, predictions.filter(p => p.was_correct).length)
+  const lastBrier = db.raw.prepare(
+    `SELECT brier_score, total_preds FROM pm_brier_scores ORDER BY id DESC LIMIT 1`
+  ).get()
+  const brierChanged = !lastBrier ||
+    Math.abs(lastBrier.brier_score - brier.brierScore) > 0.005 ||
+    lastBrier.total_preds !== predictions.length
 
-  // Record lesson
-  recordLesson("brier_score", `Brier: ${brier.brierScore.toFixed(3)}, Calibration: ${brier.calibration.toFixed(3)}`)
+  if (brierChanged) {
+    db.raw.prepare(`
+      INSERT INTO pm_brier_scores (period, brier_score, calibration, resolution, total_preds, correct)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(period, brier.brierScore, brier.calibration, brier.resolution, predictions.length, predictions.filter((p) => p.was_correct).length)
+
+    recordLesson("brier_score", `Brier: ${brier.brierScore.toFixed(3)}, Calibration: ${brier.calibration.toFixed(3)}`)
+  }
 
   const lessonLines = lessons.slice(0, 3).map(l => `• ${l.lesson}`).join("\n")
 

@@ -15,6 +15,7 @@ import strategyEngine from "./strategy-engine.mjs"
 import selfImprover from "./self-improver.mjs"
 import adaptiveLearner from "./adaptive-learner.mjs"
 import smartBrain from "./smart-brain.mjs"
+import realTrader from "./real-trader.mjs"
 import db from "../database.mjs"
 
 // ── Deduplication — track what we've already notified/traded ─
@@ -524,19 +525,21 @@ db.raw.exec(`
   );
 `)
 
-// Migration: add close_reason column to existing tables
-try {
-  db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN close_reason TEXT`)
-} catch {} // Column already exists
+// Migrations: add columns to existing tables
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN close_reason TEXT`) } catch {}
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN entry_fee REAL DEFAULT 0`) } catch {}
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN exit_fee REAL DEFAULT 0`) } catch {}
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN category TEXT DEFAULT 'other'`) } catch {}
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN slippage REAL DEFAULT 0`) } catch {}
 
 const virtualStmts = {
   openPosition: db.raw.prepare(`
-    INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, entry_fee, category, slippage)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getOpenPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio WHERE status = 'open'`),
   closePosition: db.raw.prepare(`
-    UPDATE pm_virtual_portfolio SET status = 'closed', exit_price = ?, pnl = ?, close_reason = ?, closed_at = datetime('now')
+    UPDATE pm_virtual_portfolio SET status = 'closed', exit_price = ?, pnl = ?, close_reason = ?, exit_fee = ?, closed_at = datetime('now')
     WHERE id = ?
   `),
   getAllPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio ORDER BY created_at DESC LIMIT ?`),
@@ -549,6 +552,10 @@ const virtualStmts = {
            MIN(pnl) as worst_trade,
            COALESCE(SUM(size_usdc), 0) as total_volume
     FROM pm_virtual_portfolio WHERE status = 'closed'
+  `),
+  getTotalFees: db.raw.prepare(`
+    SELECT COALESCE(SUM(COALESCE(entry_fee,0) + COALESCE(exit_fee,0) + COALESCE(slippage,0)), 0) as total_fees
+    FROM pm_virtual_portfolio
   `),
   getTodayPnL: db.raw.prepare(`
     SELECT COALESCE(SUM(pnl), 0) as day_pnl, COUNT(*) as trades
@@ -567,9 +574,21 @@ const virtualStmts = {
   getDailyStats: db.raw.prepare(`SELECT * FROM pm_virtual_stats ORDER BY date DESC LIMIT ?`),
 }
 
-const VIRTUAL_BANKROLL = 1000
-const VIRTUAL_MAX_BET = 25 // $25 max — small bets, many markets
+const VIRTUAL_STARTING_BANKROLL = 1000
+const VIRTUAL_MAX_BET = 35 // Raised from $25 — proven strategies deserve more capital
 const VIRTUAL_MAX_OPEN = 150 // 150 positions — spread across entire market
+
+/**
+ * Get current virtual bankroll (compounded from PnL)
+ */
+function getVirtualBankroll() {
+  try {
+    const pnl = virtualStmts.getVirtualPnL.get()
+    return VIRTUAL_STARTING_BANKROLL + (pnl?.total_pnl || 0)
+  } catch {
+    return VIRTUAL_STARTING_BANKROLL
+  }
+}
 
 // ⚠️ NEVER DELETE DATA — the DB is the bot's memory and brain.
 // Every trade, prediction, lesson, and mistake is permanent.
@@ -582,12 +601,12 @@ async function autoVirtualTrade(scanResults) {
   const openPositions = virtualStmts.getOpenPositions.all()
   const openValue = virtualStmts.getOpenValue.get()?.total_invested || 0
   const pnlData = virtualStmts.getVirtualPnL.get()
-  const currentBalance = VIRTUAL_BANKROLL + (pnlData?.total_pnl || 0)
+  const currentBalance = getVirtualBankroll()
   const availableCapital = currentBalance - openValue
   let tradesPlaced = 0
 
   // Drawdown check — reduce or stop trading if losing too much
-  const peakBalance = VIRTUAL_BANKROLL // Simple: use starting balance as peak
+  const peakBalance = VIRTUAL_STARTING_BANKROLL // Simple: use starting balance as peak
   const drawdownKelly = selfImprover.getDrawdownAdjustedKelly(1.0, currentBalance, peakBalance)
   if (drawdownKelly === 0) {
     console.log(`[VIRTUAL] HALTED — drawdown too deep. Balance: $${currentBalance.toFixed(2)}`)
@@ -636,12 +655,28 @@ async function autoVirtualTrade(scanResults) {
       price = pick.currentPrice || pick.price || 0
     }
     if (price <= 0.01 || price >= 0.99) continue
-    const shares = betSize / price
     const marketId = pick.market?.id || pick.event?.eventId || ""
     const question = pick.market?.question || pick.event?.title || ""
-
-    // Skip if no market identifier
     if (!marketId) continue
+
+    // ── REALISTIC EXECUTION: slippage + fees ──
+    // Simulate spread slippage: buying costs ~0.5-1% more than mid price
+    const slippagePct = 0.005 + Math.random() * 0.005 // 0.5-1% slippage
+    const slippedPrice = Math.min(price * (1 + slippagePct), 0.99)
+    const slippageCost = (slippedPrice - price) * (betSize / slippedPrice)
+
+    // Entry fee: maker limit order = 0%, but simulate realistic execution
+    // Most of our orders will be limit (maker = 0%), with some taker fills
+    // Assume 70% maker / 30% taker mix for realistic simulation
+    const category = smartBrain.detectCategory(question)
+    const takerRate = realTrader.TAKER_FEE_RATES[category] || realTrader.TAKER_FEE_RATES.other
+    const entryShares = betSize / slippedPrice
+    const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
+    const entryFee = takerFee * 0.3 // 30% chance of taker fill, 70% maker (free)
+
+    // Net: deduct slippage + entry fee from effective position
+    const effectiveBet = betSize - entryFee
+    const shares = effectiveBet / slippedPrice
 
     try {
       virtualStmts.openPosition.run(
@@ -649,14 +684,18 @@ async function autoVirtualTrade(scanResults) {
         question.slice(0, 200),
         outcome,
         pick.direction || "BUY",
-        price,
+        slippedPrice, // Realistic entry including slippage
         shares,
         betSize,
         pick.strategy || "Auto",
+        Math.round(entryFee * 10000) / 10000, // entry_fee
+        category,
+        Math.round(slippageCost * 10000) / 10000, // slippage
       )
       tradesPlaced++
       _tradedMarkets.add(marketId)
-      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy})`)
+      const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
+      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr})`)
     } catch (err) {
       console.error(`[VIRTUAL] Trade failed:`, err.message)
     }
@@ -789,9 +828,25 @@ async function checkVirtualPositions() {
       }
 
       if (shouldClose) {
-        const pnl = (currentPrice - pos.entry_price) * pos.shares
-        virtualStmts.closePosition.run(currentPrice, pnl, closeReason, pos.id)
-        closed.push({ ...pos, exit_price: currentPrice, pnl, close_reason: closeReason })
+        const grossPnl = (currentPrice - pos.entry_price) * pos.shares
+
+        // ── REALISTIC EXIT FEES ──
+        // Resolution (market resolves YES/NO) = FREE settlement
+        // Early exit (stop-loss, take-profit, stale) = taker fee to sell
+        let exitFee = 0
+        if (closeReason !== "resolved" && closeReason !== "snipe-won" && closeReason !== "expired-worthless") {
+          const cat = pos.category || smartBrain.detectCategory(pos.market_question || "")
+          const exitFeeCalc = realTrader.calculateTakerFee(pos.shares * currentPrice, currentPrice, cat)
+          exitFee = exitFeeCalc.fee
+        }
+
+        // Net P&L = gross - entry fee - exit fee
+        const entryFee = pos.entry_fee || 0
+        const pnl = grossPnl - entryFee - exitFee
+        const totalFees = entryFee + exitFee
+
+        virtualStmts.closePosition.run(currentPrice, pnl, closeReason, exitFee, pos.id)
+        closed.push({ ...pos, exit_price: currentPrice, pnl, close_reason: closeReason, fees: totalFees })
 
         // LEARN from this trade — adjust strategy weights, price range, and category stats
         adaptiveLearner.learnFromTrade({
@@ -799,11 +854,12 @@ async function checkVirtualPositions() {
           entry_price: pos.entry_price,
           pnl,
           close_reason: closeReason,
-          category: smartBrain.detectCategory(pos.market_question || ""),
+          category: pos.category || smartBrain.detectCategory(pos.market_question || ""),
         })
         _tradedMarkets.delete(pos.market_id) // Allow re-trading this market
 
-        console.log(`[VIRTUAL] Closed: ${pos.outcome.slice(0, 25)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} (${closeReason})`)
+        const feeStr = totalFees > 0.01 ? ` fees:$${totalFees.toFixed(2)}` : ""
+        console.log(`[VIRTUAL] Closed: ${pos.outcome.slice(0, 25)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} (${closeReason}${feeStr})`)
       }
     } catch (err) {
       console.error(`[VIRTUAL] Position check error: ${err.message}`)
@@ -824,9 +880,9 @@ function generateScorecard() {
   const openValue = virtualStmts.getOpenValue.get()?.total_invested || 0
 
   const totalPnL = pnl?.total_pnl || 0
-  const currentBalance = VIRTUAL_BANKROLL + totalPnL
+  const currentBalance = VIRTUAL_STARTING_BANKROLL + totalPnL
   const winRate = pnl?.total_trades > 0 ? (pnl.wins / pnl.total_trades * 100) : 0
-  const roi = (totalPnL / VIRTUAL_BANKROLL * 100)
+  const roi = (totalPnL / VIRTUAL_STARTING_BANKROLL * 100)
 
   let rating = "🔴 Learning"
   if (winRate >= 50 && totalPnL > 0) rating = "🟡 Getting there"
@@ -837,50 +893,116 @@ function generateScorecard() {
   // Save daily stats
   const date = new Date().toISOString().split("T")[0]
   virtualStmts.upsertDailyStats.run(
-    date, VIRTUAL_BANKROLL, currentBalance,
+    date, VIRTUAL_STARTING_BANKROLL, currentBalance,
     0, pnl?.total_trades || 0, pnl?.wins || 0, pnl?.losses || 0,
     today?.day_pnl || 0, totalPnL, winRate,
     pnl?.best_trade || 0, pnl?.worst_trade || 0, rating,
   )
 
-  // Open positions summary
-  const posLines = openPositions.slice(0, 5).map((p) =>
-    `  • ${p.outcome.slice(0, 20)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})`,
-  ).join("\n")
-
   const tag = process.platform === "darwin" ? "🏠" : "☁️"
+  const totalFees = virtualStmts.getTotalFees.get()?.total_fees || 0
 
-  // Learning insights
-  const recentClosed = db.raw.prepare(
-    `SELECT strategy, COUNT(*) as cnt, SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins, SUM(pnl) as total_pnl
-     FROM pm_virtual_portfolio WHERE status='closed' GROUP BY strategy`
-  ).all()
+  // ── Strategy breakdown with fees (include open positions' entry fees) ──
+  const strategyStats = db.raw.prepare(`
+    SELECT strategy,
+      COUNT(*) as cnt,
+      SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins,
+      ROUND(SUM(pnl), 2) as total_pnl,
+      ROUND(SUM(COALESCE(entry_fee,0) + COALESCE(exit_fee,0) + COALESCE(slippage,0)), 2) as total_fees,
+      ROUND(SUM(size_usdc), 2) as volume,
+      ROUND(AVG(pnl), 2) as avg_pnl
+    FROM pm_virtual_portfolio WHERE strategy != 'v2-fee-reset'
+    GROUP BY strategy ORDER BY total_pnl DESC
+  `).all()
 
-  let learningText = ""
-  if (recentClosed.length > 0) {
-    learningText = `\n*What I'm learning:*\n`
-    for (const s of recentClosed) {
+  let stratText = ""
+  if (strategyStats.length > 0) {
+    stratText = `\n*Strategy Breakdown:*\n`
+    for (const s of strategyStats) {
       const wr = s.cnt > 0 ? (s.wins / s.cnt * 100).toFixed(0) : 0
-      const emoji = s.total_pnl >= 0 ? "✅" : "❌"
-      learningText += `${emoji} ${s.strategy}: ${wr}% win rate, ${s.total_pnl >= 0 ? "+" : ""}$${s.total_pnl.toFixed(2)}\n`
+      const emoji = s.total_pnl >= 0 ? "+" : ""
+      const returnPct = s.volume > 0 ? (s.total_pnl / s.volume * 100).toFixed(1) : "0"
+      const feeStr = s.total_fees > 0.01 ? ` | Fees: -$${s.total_fees}` : ""
+      stratText += `  *${s.strategy}*: ${s.wins}W/${s.cnt - s.wins}L (${wr}%) | ${emoji}$${s.total_pnl} | ROI: ${returnPct}%${feeStr}\n`
     }
   }
 
+  // ── Category breakdown ──
+  const catStats = db.raw.prepare(`
+    SELECT COALESCE(category, 'other') as cat,
+      COUNT(*) as cnt,
+      ROUND(SUM(pnl), 2) as total_pnl,
+      ROUND(SUM(COALESCE(entry_fee,0) + COALESCE(exit_fee,0) + COALESCE(slippage,0)), 2) as fees
+    FROM pm_virtual_portfolio WHERE category IS NOT NULL AND category != 'other'
+    GROUP BY category ORDER BY total_pnl DESC
+  `).all()
+
+  let catText = ""
+  if (catStats.length > 0) {
+    catText = `\n*By Category:*\n`
+    for (const c of catStats) {
+      const feeRate = (realTrader.TAKER_FEE_RATES[c.cat] || 0) * 100
+      catText += `  ${c.cat}: ${c.total_pnl >= 0 ? "+" : ""}$${c.total_pnl} (${c.cnt} trades) | taker: ${feeRate.toFixed(1)}%\n`
+    }
+  }
+
+  // ── Fee breakdown ──
+  const feeBreakdown = db.raw.prepare(`
+    SELECT
+      ROUND(COALESCE(SUM(entry_fee), 0), 2) as entry_fees,
+      ROUND(COALESCE(SUM(exit_fee), 0), 2) as exit_fees,
+      ROUND(COALESCE(SUM(slippage), 0), 2) as total_slippage
+    FROM pm_virtual_portfolio
+  `).get()
+
+  const entryF = feeBreakdown?.entry_fees || 0
+  const exitF = feeBreakdown?.exit_fees || 0
+  const slipF = feeBreakdown?.total_slippage || 0
+  const totalCost = entryF + exitF + slipF
+
+  let feeText = `\n*Fee Breakdown:*\n`
+  feeText += `  Entry (maker/taker mix): $${entryF.toFixed(2)}\n`
+  feeText += `  Exit (taker on sells): $${exitF.toFixed(2)}\n`
+  feeText += `  Slippage: $${slipF.toFixed(2)}\n`
+  feeText += `  *Total cost:* $${totalCost.toFixed(2)}\n`
+
+  // ── Open positions detail ──
+  let posText = ""
+  if (openPositions.length > 0) {
+    posText = `\n*Open Positions (${openPositions.length}):*\n`
+    for (const p of openPositions.slice(0, 8)) {
+      const ef = p.entry_fee || 0
+      const cat = p.category || "?"
+      const ageH = ((Date.now() - new Date(p.created_at).getTime()) / 3600000).toFixed(1)
+      posText += `  ${(p.outcome || "").slice(0, 22)} @ ${(p.entry_price * 100).toFixed(1)}% | $${p.size_usdc.toFixed(2)} | ${p.strategy} | ${cat}`
+      if (ef > 0.001) posText += ` | fee:$${ef.toFixed(3)}`
+      posText += ` | ${ageH}h\n`
+    }
+    if (openPositions.length > 8) posText += `  _...and ${openPositions.length - 8} more_\n`
+  }
+
+  // Save daily stats
+  const statsDate = new Date().toISOString().split("T")[0]
+  virtualStmts.upsertDailyStats.run(
+    statsDate, VIRTUAL_STARTING_BANKROLL, currentBalance,
+    0, pnl?.total_trades || 0, pnl?.wins || 0, pnl?.losses || 0,
+    today?.day_pnl || 0, totalPnL, winRate,
+    pnl?.best_trade || 0, pnl?.worst_trade || 0, rating,
+  )
+
   return `${tag} *Virtual Trading Scorecard*\n\n` +
-    `*Balance:* $${currentBalance.toFixed(2)} (started $${VIRTUAL_BANKROLL})\n` +
-    `*Total P&L:* ${totalPnL >= 0 ? "+" : ""}$${totalPnL.toFixed(2)} (${roi >= 0 ? "+" : ""}${roi.toFixed(1)}%)\n` +
+    `*Balance:* $${currentBalance.toFixed(2)} (started $${VIRTUAL_STARTING_BANKROLL})\n` +
+    `*Gross P&L:* ${(totalPnL + totalFees) >= 0 ? "+" : ""}$${(totalPnL + totalFees).toFixed(2)}\n` +
+    `*Total Fees:* -$${totalFees.toFixed(2)}\n` +
+    `*Net P&L:* ${totalPnL >= 0 ? "+" : ""}$${totalPnL.toFixed(2)} (${roi >= 0 ? "+" : ""}${roi.toFixed(1)}% ROI)\n` +
     `*Today:* ${(today?.day_pnl || 0) >= 0 ? "+" : ""}$${(today?.day_pnl || 0).toFixed(2)}\n\n` +
-    `*Stats:*\n` +
-    `  Trades: ${pnl?.total_trades || 0} (${pnl?.wins || 0}W / ${pnl?.losses || 0}L)\n` +
-    `  Win rate: ${winRate.toFixed(0)}%\n` +
-    `  Best trade: +$${(pnl?.best_trade || 0).toFixed(2)}\n` +
-    `  Worst trade: $${(pnl?.worst_trade || 0).toFixed(2)}\n` +
-    `  Volume: $${(pnl?.total_volume || 0).toFixed(2)}\n\n` +
-    `*Rating:* ${rating}\n\n` +
-    (openPositions.length > 0 ? `*Open Positions (${openPositions.length}):*\n${posLines}\n\n` : "") +
-    `*Capital:* $${(currentBalance - openValue).toFixed(2)} free / $${openValue.toFixed(2)} invested\n` +
-    learningText + `\n` +
-    `_Virtual money — tracking to prove the system works before going live_`
+    `*Stats:* ${pnl?.total_trades || 0} trades | ${pnl?.wins || 0}W / ${pnl?.losses || 0}L | Win: ${winRate.toFixed(0)}%\n` +
+    `*Best:* +$${(pnl?.best_trade || 0).toFixed(2)} | *Worst:* $${(pnl?.worst_trade || 0).toFixed(2)} | *Avg:* $${(pnl?.total_trades > 0 ? totalPnL / pnl.total_trades : 0).toFixed(2)}/trade\n` +
+    `*Volume:* $${(pnl?.total_volume || 0).toFixed(2)}\n` +
+    `*Rating:* ${rating}\n` +
+    stratText + catText + feeText + posText +
+    `\n*Capital:* $${(currentBalance - openValue).toFixed(2)} free / $${openValue.toFixed(2)} invested\n` +
+    `_Simulating real fees — what you see is what you'd get_`
 }
 
 /**
@@ -913,14 +1035,124 @@ export function startAutonomous() {
   if (_isRunning) return false
   _isRunning = true
 
-  // Load existing open positions into dedup set (persist across restarts)
+  // ── ONE-TIME RESET: close all old positions, start fresh with fee formula ──
+  // Remove this block after first deploy (or leave — it's idempotent)
   try {
-    const openPositions = virtualStmts.getOpenPositions.all()
-    for (const pos of openPositions) {
-      if (pos.market_id) _tradedMarkets.add(pos.market_id)
+    const oldOpen = virtualStmts.getOpenPositions.all()
+    if (oldOpen.length > 0) {
+      // Check if any position was opened AFTER this deploy (has category set to non-default)
+      // Old positions have category=NULL or 'other' default, new ones have real categories
+      const hasNewFormula = oldOpen.some((p) => p.category && p.category !== "other" && p.slippage > 0)
+      if (!hasNewFormula) {
+        // All old positions — close them at entry price (0 P&L) to start fresh
+        db.raw.prepare(`
+          UPDATE pm_virtual_portfolio
+          SET status='closed', exit_price=entry_price, pnl=0, close_reason='v2-fee-reset', exit_fee=0, closed_at=datetime('now')
+          WHERE status='open'
+        `).run()
+        _tradedMarkets.clear()
+        console.log(`[AUTO-ANALYST] ✅ Reset ${oldOpen.length} old positions — starting fresh with fee formula`)
+      } else {
+        // New formula positions exist — just load dedup set normally
+        const positions = virtualStmts.getOpenPositions.all()
+        for (const pos of positions) {
+          if (pos.market_id) _tradedMarkets.add(pos.market_id)
+        }
+        console.log(`[AUTO-ANALYST] Loaded ${positions.length} open positions into dedup set`)
+      }
     }
-    console.log(`[AUTO-ANALYST] Loaded ${openPositions.length} open positions into dedup set`)
-  } catch {}
+  } catch (err) {
+    console.error(`[AUTO-ANALYST] Reset error: ${err.message}`)
+  }
+
+  // ── ONE-TIME BACKFILL: estimate fees for old trades that had none ──
+  // Idempotent: checks if backfill already ran by looking for the marker
+  try {
+    const backfillMarker = db.raw.prepare(
+      `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio WHERE close_reason LIKE '%fee-backfill-applied%'`
+    ).get()
+
+    const needsBackfill = db.raw.prepare(
+      `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio
+       WHERE status='closed' AND COALESCE(entry_fee,0)=0 AND COALESCE(slippage,0)=0
+       AND COALESCE(close_reason,'') NOT LIKE '%v2-fee-reset%'
+       AND COALESCE(close_reason,'') NOT LIKE '%fee-backfill-applied%'`
+    ).get()
+
+    if (backfillMarker.cnt === 0 && needsBackfill.cnt > 0) {
+      console.log(`[AUTO-ANALYST] ⏳ Backfilling fees for ${needsBackfill.cnt} old trades...`)
+
+      const oldTrades = db.raw.prepare(
+        `SELECT id, entry_price, exit_price, shares, size_usdc, pnl, close_reason, strategy, market_question
+         FROM pm_virtual_portfolio
+         WHERE status='closed' AND COALESCE(entry_fee,0)=0 AND COALESCE(slippage,0)=0
+         AND COALESCE(close_reason,'') NOT LIKE '%v2-fee-reset%'
+         AND COALESCE(close_reason,'') NOT LIKE '%fee-backfill-applied%'`
+      ).all()
+
+      const updateStmt = db.raw.prepare(
+        `UPDATE pm_virtual_portfolio
+         SET entry_fee=?, exit_fee=?, slippage=?, pnl=?,
+             close_reason = CASE
+               WHEN close_reason IS NULL OR close_reason = '' THEN 'fee-backfill-applied'
+               ELSE close_reason || ' fee-backfill-applied'
+             END
+         WHERE id=?`
+      )
+
+      let totalBackfilledFees = 0
+      const batchUpdate = db.raw.transaction(() => {
+        for (const t of oldTrades) {
+          const price = t.entry_price || 0.5
+          const size = t.size_usdc || 0
+
+          // 1. Estimate slippage: avg 0.75% of entry price (midpoint of 0.5-1%)
+          const slippagePct = 0.0075
+          const slippedPrice = Math.min(price * (1 + slippagePct), 0.99)
+          const slippageCost = (slippedPrice - price) * (size / slippedPrice)
+
+          // 2. Estimate entry fee: 30% taker chance, "other" category (1.25%) since old trades have no category
+          const takerRate = realTrader.TAKER_FEE_RATES.other
+          const entryShares = size / slippedPrice
+          const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
+          const entryFee = takerFee * 0.3
+
+          // 3. Estimate exit fee: free for resolution wins, taker fee for early exits
+          let exitFee = 0
+          const reason = (t.close_reason || "").toLowerCase()
+          const isResolution = reason.includes("resolved") || reason.includes("snipe") || reason.includes("expired") || reason === ""
+          if (!isResolution && t.exit_price && t.exit_price < 0.98) {
+            // Early exit (stop-loss, take-profit, stale) = taker sell fee
+            const exitCalc = realTrader.calculateTakerFee((t.shares || 0) * t.exit_price, t.exit_price, "other")
+            exitFee = exitCalc.fee
+          }
+
+          const totalFee = Math.round((entryFee + exitFee + slippageCost) * 10000) / 10000
+          const newPnl = (t.pnl || 0) - entryFee - exitFee - slippageCost
+          totalBackfilledFees += totalFee
+
+          updateStmt.run(
+            Math.round(entryFee * 10000) / 10000,
+            Math.round(exitFee * 10000) / 10000,
+            Math.round(slippageCost * 10000) / 10000,
+            Math.round(newPnl * 10000) / 10000,
+            t.id
+          )
+        }
+      })
+      batchUpdate()
+
+      console.log(`[AUTO-ANALYST] ✅ Backfilled fees on ${oldTrades.length} trades — total deducted: $${totalBackfilledFees.toFixed(2)}`)
+
+      // Log impact on balance
+      const newPnl = db.raw.prepare(`SELECT COALESCE(SUM(pnl),0) as p FROM pm_virtual_portfolio WHERE status='closed'`).get()
+      console.log(`[AUTO-ANALYST] 💰 New net P&L after backfill: $${newPnl.p.toFixed(2)} (balance: $${(VIRTUAL_STARTING_BANKROLL + newPnl.p).toFixed(2)})`)
+    } else if (backfillMarker.cnt > 0) {
+      console.log(`[AUTO-ANALYST] Fee backfill already applied (${backfillMarker.cnt} trades marked)`)
+    }
+  } catch (err) {
+    console.error(`[AUTO-ANALYST] Fee backfill error: ${err.message}`)
+  }
 
   console.log("[AUTO-ANALYST] Started autonomous mode with virtual trading")
 
@@ -1033,8 +1265,7 @@ async function runVirtualTradingCycle() {
     const closed = await checkVirtualPositions()
 
     // 2. Run SMART BRAIN scan
-    const pnlData = virtualStmts.getVirtualPnL.get()
-    const currentBalance = VIRTUAL_BANKROLL + (pnlData?.total_pnl || 0)
+    const currentBalance = getVirtualBankroll()
     const openPositions = virtualStmts.getOpenPositions.all()
 
     const brainScan = await smartBrain.smartScan(currentBalance)
@@ -1055,62 +1286,151 @@ async function runVirtualTradingCycle() {
       }
 
       const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
-      if (betSize < 5 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
+      if (betSize < 3 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
 
-      const shares = betSize / price
+      // ── REALISTIC EXECUTION: slippage + fees ──
+      const slipPct = 0.005 + Math.random() * 0.005
+      const slippedPrice = Math.min(price * (1 + slipPct), 0.99)
+      const slipCost = (slippedPrice - price) * (betSize / slippedPrice)
+
+      const cat = smartBrain.detectCategory(pick.market.question || "")
+      const takerRate = realTrader.TAKER_FEE_RATES[cat] || realTrader.TAKER_FEE_RATES.other
+      const entryShares = betSize / slippedPrice
+      const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
+      const entryFee = takerFee * 0.3 // 70% maker / 30% taker mix
+
+      const effectiveBet = betSize - entryFee
+      const shares = effectiveBet / slippedPrice
 
       try {
         virtualStmts.openPosition.run(
           pick.market.id, (pick.market.question || "").slice(0, 200),
           pick.outcome || "YES", pick.direction || "BUY",
-          price, shares, betSize, pick.strategy || "Smart Brain",
+          slippedPrice, shares, betSize, pick.strategy || "Smart Brain",
+          Math.round(entryFee * 10000) / 10000,
+          cat,
+          Math.round(slipCost * 10000) / 10000,
         )
         _tradedMarkets.add(pick.market.id)
         tradesPlaced++
-        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(price * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy})`)
+        const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
+        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr})`)
       } catch (err) {
         console.error(`[BRAIN] Trade failed:`, err.message)
       }
     }
 
-    // 3. Send ONE combined message if anything happened (closes + opens)
+    // 3. Send DETAILED messages for every open/close
     const tag = process.platform === "darwin" ? "🏠" : "☁️"
     const hasActivity = closed.length > 0 || tradesPlaced > 0
 
     if (hasActivity) {
       const pnlStats = virtualStmts.getVirtualPnL.get()
-      const balance = VIRTUAL_BANKROLL + (pnlStats?.total_pnl || 0)
-      let msg = `${tag} *Trading Update*\n\n`
+      const balance = getVirtualBankroll()
+      const totalFees = virtualStmts.getTotalFees.get()?.total_fees || 0
 
-      // Closed positions
+      // ── DETAILED CLOSE messages ──
       if (closed.length > 0) {
         const totalClosePnl = closed.reduce((s, c) => s + c.pnl, 0)
-        msg += `*Closed:*\n`
+        const totalCloseFees = closed.reduce((s, c) => s + (c.fees || 0), 0)
+
+        let closeMsg = `${tag} *Positions Closed*\n\n`
         for (const c of closed) {
           const icon = c.pnl >= 0 ? "✅" : "❌"
-          const reason = c.close_reason ? ` (${c.close_reason})` : ""
-          msg += `${icon} ${c.outcome.slice(0, 25)} — ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}${reason}\n`
+          const holdTime = c.closed_at && c.created_at
+            ? ((new Date(c.closed_at) - new Date(c.created_at)) / 3600000).toFixed(1)
+            : "?"
+          const returnPct = c.size_usdc > 0 ? ((c.pnl / c.size_usdc) * 100).toFixed(1) : "0"
+          const entryFee = c.entry_fee || 0
+          const exitFee = c.exit_fee || (c.fees || 0) - entryFee
+          closeMsg += `${icon} *${(c.outcome || "").slice(0, 35)}*\n`
+          closeMsg += `   Strategy: ${c.strategy || "Unknown"}\n`
+          closeMsg += `   Entry: ${(c.entry_price * 100).toFixed(1)}% → Exit: ${(c.exit_price * 100).toFixed(1)}%\n`
+          closeMsg += `   Size: $${c.size_usdc.toFixed(2)} | Shares: ${c.shares?.toFixed(1) || "?"}\n`
+          closeMsg += `   Gross: ${c.pnl + (c.fees || 0) >= 0 ? "+" : ""}$${(c.pnl + (c.fees || 0)).toFixed(2)}`
+          if ((c.fees || 0) > 0.01) closeMsg += ` | Fees: -$${(c.fees).toFixed(2)}`
+          closeMsg += ` | *Net: ${c.pnl >= 0 ? "+" : ""}$${c.pnl.toFixed(2)}* (${returnPct}%)\n`
+          closeMsg += `   Reason: ${c.close_reason || "unknown"} | Held: ${holdTime}h\n\n`
         }
-        msg += `Close P&L: ${totalClosePnl >= 0 ? "+" : ""}$${totalClosePnl.toFixed(2)}\n\n`
+        closeMsg += `*Batch P&L:* ${totalClosePnl >= 0 ? "+" : ""}$${totalClosePnl.toFixed(2)}`
+        if (totalCloseFees > 0.01) closeMsg += ` (fees: -$${totalCloseFees.toFixed(2)})`
+
+        await safeSend(_bot, _chatId, closeMsg)
       }
 
-      // New trades
+      // ── DETAILED OPEN messages ──
       if (tradesPlaced > 0) {
         const allOpen = virtualStmts.getOpenPositions.all()
         const recent = allOpen.slice(-tradesPlaced)
-        msg += `*Opened:*\n`
+
+        let openMsg = `${tag} *New Positions Opened*\n\n`
         for (const p of recent) {
-          msg += `• ${p.outcome.slice(0, 25)} @ ${(p.entry_price * 100).toFixed(0)}% — $${p.size_usdc.toFixed(2)} (${p.strategy})\n`
+          const maxProfit = p.strategy?.includes("Snipe")
+            ? ((1.0 - p.entry_price) * p.shares).toFixed(2)
+            : ((p.entry_price * 0.20) * p.shares).toFixed(2)
+          const feeOnEntry = p.entry_fee || 0
+          const cat = p.category || "other"
+          const takerFeeRate = (realTrader.TAKER_FEE_RATES[cat] || 0) * 100
+          openMsg += `*${(p.outcome || "").slice(0, 40)}*\n`
+          openMsg += `   Strategy: ${p.strategy} | Category: ${cat}\n`
+          openMsg += `   Entry: ${(p.entry_price * 100).toFixed(2)}%`
+          if (p.slippage > 0.001) openMsg += ` (slip: $${p.slippage.toFixed(3)})`
+          openMsg += `\n`
+          openMsg += `   Size: $${p.size_usdc.toFixed(2)} | Shares: ${p.shares.toFixed(1)}\n`
+          if (feeOnEntry > 0.001) openMsg += `   Entry fee: $${feeOnEntry.toFixed(3)} (maker/taker mix)\n`
+          openMsg += `   Exit: free if resolved | taker ${takerFeeRate.toFixed(2)}% if sold\n`
+          openMsg += `   Target: +$${maxProfit} max profit\n\n`
         }
-        msg += `\n`
+
+        openMsg += `*Portfolio:* $${balance.toFixed(2)} | ${pnlStats?.total_trades || 0} trades | Win: ${pnlStats?.total_trades > 0 ? ((pnlStats.wins / pnlStats.total_trades) * 100).toFixed(0) : 0}%`
+        openMsg += ` | Fees: -$${totalFees.toFixed(2)} total`
+        openMsg += ` | Open: ${virtualStmts.getOpenPositions.all().length}`
+
+        await safeSend(_bot, _chatId, openMsg)
       }
-
-      msg += `*Balance:* $${balance.toFixed(2)} | Win: ${pnlStats?.total_trades > 0 ? (pnlStats.wins / pnlStats.total_trades * 100).toFixed(0) : 0}% | Open: ${virtualStmts.getOpenPositions.all().length}`
-
-      await safeSend(_bot, _chatId, msg)
     } else {
-      // Nothing happened — just log, don't message
       console.log(`[BRAIN] Cycle: scanned ${brainScan.total}, approved ${brainScan.approved.length}, no new trades`)
+    }
+
+    // 2.5. REAL MONEY EXECUTION — parallel to virtual
+    if (realTrader.isRealMode() && _chatId) {
+      try {
+        const walletState = await realTrader.getWalletState(_chatId)
+        if (walletState.connected && !walletState.error) {
+          // Manage existing orders (check fills, cancel stale)
+          const managed = await realTrader.manageOrders(_chatId)
+          if (managed.filled > 0 || managed.cancelled > 0) {
+            console.log(`[REAL] Managed: ${managed.filled} filled, ${managed.cancelled} cancelled`)
+          }
+
+          // Check positions for resolution / stop-loss / take-profit
+          const posResult = await realTrader.checkPositions(_chatId)
+          if (posResult.closed > 0) {
+            console.log(`[REAL] Closed ${posResult.closed} positions`)
+          }
+
+          // Place new trades from brain scan (filtered by phase + risk)
+          const realResult = await realTrader.processApprovedTrades(_chatId, brainScan.approved, walletState)
+          if (realResult.placed > 0) {
+            const phase = realResult.phase
+            let msg = `💰 *Real Money Update*\n\n`
+            msg += `Phase: ${phase} | Balance: $${walletState.usdc.toFixed(2)}\n`
+            msg += `Placed: ${realResult.placed} orders | Skipped: ${realResult.skipped}\n\n`
+            for (const r of realResult.results) {
+              msg += `• ${r.side} ${(r.price * 100).toFixed(0)}% — $${r.size.toFixed(2)} (${r.strategy})\n`
+            }
+            msg += `\nFees: $0 (maker limit orders)`
+            await safeSend(_bot, _chatId, msg)
+          }
+
+          if (posResult.closed > 0) {
+            const scorecard = realTrader.generateScorecard(walletState)
+            await safeSend(_bot, _chatId, scorecard)
+          }
+        }
+      } catch (err) {
+        console.error(`[REAL] Trading cycle error: ${err.message}`)
+      }
     }
 
     // 3. Record predictions from brain-approved picks (deduplicated)
