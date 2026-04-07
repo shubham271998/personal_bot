@@ -665,62 +665,93 @@ async function autoVirtualTrade(scanResults) {
     const question = pick.market?.question || pick.event?.title || ""
     if (!marketId) continue
 
-    // ── REALISTIC EXECUTION: fill probability + slippage + fees ──
-    // Real Polymarket order books are thin at extreme prices. Simulate realistic fills.
+    // ── REAL ORDER BOOK EXECUTION ──
+    // Fetch actual Polymarket order book to determine if we can fill
+    const tokenId = pick.market?.outcomes?.find(o => o.name === outcome)?.tokenId
+    const category = smartBrain.detectCategory(question)
 
-    // Fill probability: at 50% price ~95% chance of fill, at 95%+ price drops sharply
-    // Based on real Polymarket order book depth analysis:
-    //   50-70%: ~90% fill rate (decent liquidity)
-    //   70-85%: ~75% fill rate (moderate)
-    //   85-92%: ~50% fill rate (thin books, many competing makers)
-    //   92-95%: ~30% fill rate (very thin, crowded)
-    //   95-99%: ~15% fill rate (nearly empty books, everyone racing)
-    let fillProb
-    if (price < 0.70) fillProb = 0.90
-    else if (price < 0.85) fillProb = 0.75
-    else if (price < 0.92) fillProb = 0.50
-    else if (price < 0.95) fillProb = 0.30
-    else fillProb = 0.15
+    let book = null, bestBid = 0, bestAsk = 1, spread = 0, bidDepth = 0, askDepth = 0
+    if (tokenId) {
+      try {
+        book = await scanner.getOrderBook(tokenId)
+        if (book) {
+          bestBid = book.bids?.[0] ? parseFloat(book.bids[0].price) : 0
+          bestAsk = book.asks?.[0] ? parseFloat(book.asks[0].price) : 1
+          spread = bestAsk - bestBid
+          bidDepth = (book.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0)
+          askDepth = (book.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0)
+        }
+      } catch { /* book fetch failed, use fallback */ }
+    }
 
-    // Boost fill probability for high-volume markets (more liquidity)
-    const vol24h = pick.market?.volume24hr || 0
-    if (vol24h > 500000) fillProb = Math.min(fillProb * 1.3, 0.95)
-    else if (vol24h > 100000) fillProb = Math.min(fillProb * 1.15, 0.90)
-
-    // Roll the dice — does this order fill?
     _totalAttempted++
-    if (Math.random() > fillProb) {
+
+    // If we got real book data, use it. Otherwise fallback to price-based estimates.
+    const sharesWanted = betSize / price
+    let fillableShares = 0
+    let fillPrice = price
+    let isTaker = false
+
+    if (book && book.asks && book.asks.length > 0) {
+      // Walk the ask side — how many shares can we actually buy at what price?
+      let spent = 0
+      let sharesBought = 0
+      for (const level of book.asks) {
+        const lvlPrice = parseFloat(level.price)
+        const lvlSize = parseFloat(level.size)
+        if (lvlPrice > price * 1.03) break // Don't buy more than 3% above mid price
+        const canBuy = Math.min(lvlSize, sharesWanted - sharesBought)
+        sharesBought += canBuy
+        spent += canBuy * lvlPrice
+        if (sharesBought >= sharesWanted) break
+      }
+      fillableShares = sharesBought
+      fillPrice = sharesBought > 0 ? spent / sharesBought : price
+      isTaker = true // Lifting asks = taker
+    } else {
+      // No book data — use price-based fill probability
+      let fillProb
+      if (price < 0.70) fillProb = 0.90
+      else if (price < 0.85) fillProb = 0.75
+      else if (price < 0.92) fillProb = 0.50
+      else if (price < 0.95) fillProb = 0.30
+      else fillProb = 0.15
+      const vol24h = pick.market?.volume24hr || 0
+      if (vol24h > 500000) fillProb = Math.min(fillProb * 1.3, 0.95)
+      else if (vol24h > 100000) fillProb = Math.min(fillProb * 1.15, 0.90)
+      if (Math.random() > fillProb) {
+        _totalNoFills++
+        console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — no book data (${(fillProb * 100).toFixed(0)}% est.)`)
+        continue
+      }
+      fillableShares = sharesWanted
+    }
+
+    // Check if enough liquidity exists
+    if (fillableShares < sharesWanted * 0.20) {
       _totalNoFills++
-      console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — order book too thin (${(fillProb * 100).toFixed(0)}% fill rate)`)
+      const depthStr = book ? `ask depth: $${(askDepth * bestAsk).toFixed(0)} (${askDepth.toFixed(0)} shares)` : "no book"
+      console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — ${depthStr}, need ${sharesWanted.toFixed(0)} shares`)
       continue
     }
 
-    // Partial fills: at extreme prices you rarely get full size
-    // 50-80%: full fill, 80-92%: 60-100%, 92%+: 30-70%
-    let fillPct = 1.0
-    if (price >= 0.92) fillPct = 0.30 + Math.random() * 0.40 // 30-70%
-    else if (price >= 0.80) fillPct = 0.60 + Math.random() * 0.40 // 60-100%
+    // Partial fill: we get what the book has, up to what we want
+    let fillPct = Math.min(fillableShares / sharesWanted, 1.0)
     if (fillPct < 0.99) _totalPartialFills++
     betSize = Math.max(2, Math.round(betSize * fillPct * 100) / 100)
 
-    // Slippage: wider at extreme prices where books are thin
-    // 50-80%: 0.3-0.7%, 80-92%: 0.5-1.5%, 92%+: 1-3%
-    let slippagePct
-    if (price < 0.80) slippagePct = 0.003 + Math.random() * 0.004
-    else if (price < 0.92) slippagePct = 0.005 + Math.random() * 0.010
-    else slippagePct = 0.010 + Math.random() * 0.020
+    // Real slippage = difference between mid price and actual fill price
+    const slippedPrice = Math.min(fillPrice, 0.995)
+    const slippageCost = Math.max(0, (slippedPrice - price) * (betSize / slippedPrice))
 
-    const slippedPrice = Math.min(price * (1 + slippagePct), 0.995)
-    const slippageCost = (slippedPrice - price) * (betSize / slippedPrice)
-
-    // Entry fee: maker = 0%, taker = category rate
-    // Real execution: at extreme prices you're more likely taker (competing for scarce shares)
-    // 50-85%: 30% taker, 85-95%: 50% taker, 95%+: 70% taker
-    const category = smartBrain.detectCategory(question)
+    // Entry fee: taker if we lift asks, maker if we place a limit below best ask
+    // With real book: if our order crosses the spread, we're taker
     const takerRate = realTrader.TAKER_FEE_RATES[category] || realTrader.TAKER_FEE_RATES.other
-    const takerChance = price >= 0.95 ? 0.70 : price >= 0.85 ? 0.50 : 0.30
     const entryShares = betSize / slippedPrice
     const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
+    // If we're lifting asks = 100% taker. If we'd place limit = 0% taker.
+    // Realistic: we place at bestAsk or better — 50/50 chance of immediate fill (taker) vs queue (maker)
+    const takerChance = isTaker ? (spread < 0.02 ? 0.70 : 0.40) : 0.30
     const entryFee = takerFee * takerChance
 
     // Net: deduct slippage + entry fee from effective position
@@ -733,20 +764,31 @@ async function autoVirtualTrade(scanResults) {
         question.slice(0, 200),
         outcome,
         pick.direction || "BUY",
-        slippedPrice, // Realistic entry including slippage
+        slippedPrice,
         shares,
         betSize,
         pick.strategy || "Auto",
-        Math.round(entryFee * 10000) / 10000, // entry_fee
+        Math.round(entryFee * 10000) / 10000,
         category,
-        Math.round(slippageCost * 10000) / 10000, // slippage
-        Math.round(fillPct * 100) / 100, // fill_pct
+        Math.round(slippageCost * 10000) / 10000,
+        Math.round(fillPct * 100) / 100,
       )
       tradesPlaced++
       _tradedMarkets.add(marketId)
-      const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
-      const fillStr = fillPct < 1.0 ? ` fill:${(fillPct * 100).toFixed(0)}%` : ""
-      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr}${fillStr})`)
+
+      // ── DETAILED TRADE LOG — like a real exchange ──
+      const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
+      const fillStr = fillPct < 1.0 ? ` | fill: ${(fillPct * 100).toFixed(0)}%` : ""
+      const spreadStr = book ? `${(spread * 100).toFixed(2)}%` : "?"
+      const depthStr = book ? `B:$${(bidDepth * bestBid).toFixed(0)} A:$${(askDepth * bestAsk).toFixed(0)}` : "no book"
+      const slipStr = slippageCost > 0.001 ? ` | slip: $${slippageCost.toFixed(3)}` : ""
+      console.log(
+        `[VIRTUAL] ✅ ${outcome.slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
+        ` | $${betSize.toFixed(2)} → ${shares.toFixed(1)} shares` +
+        ` | ${pick.strategy}` +
+        ` | spread: ${spreadStr} | book: ${depthStr}` +
+        `${feeStr}${slipStr}${fillStr}`
+      )
     } catch (err) {
       console.error(`[VIRTUAL] Trade failed:`, err.message)
     }
@@ -1283,44 +1325,65 @@ async function runVirtualTradingCycle() {
         continue
       }
 
-      const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
+      let betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
       if (betSize < 3 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
 
-      // ── REALISTIC EXECUTION: fill probability + slippage + fees ──
-      let fillProb2
-      if (price < 0.70) fillProb2 = 0.90
-      else if (price < 0.85) fillProb2 = 0.75
-      else if (price < 0.92) fillProb2 = 0.50
-      else if (price < 0.95) fillProb2 = 0.30
-      else fillProb2 = 0.15
+      // ── REAL ORDER BOOK EXECUTION (BRAIN path) ──
+      const tokenId2 = pick.market?.outcomes?.find(o => o.name === pick.outcome)?.tokenId
+      const cat = smartBrain.detectCategory(pick.market.question || "")
 
-      const vol24h2 = pick.market?.volume24hr || 0
-      if (vol24h2 > 500000) fillProb2 = Math.min(fillProb2 * 1.3, 0.95)
-      else if (vol24h2 > 100000) fillProb2 = Math.min(fillProb2 * 1.15, 0.90)
+      let book2 = null, bestBid2 = 0, bestAsk2 = 1, spread2 = 0, bidDepth2 = 0, askDepth2 = 0
+      if (tokenId2) {
+        try {
+          book2 = await scanner.getOrderBook(tokenId2)
+          if (book2) {
+            bestBid2 = book2.bids?.[0] ? parseFloat(book2.bids[0].price) : 0
+            bestAsk2 = book2.asks?.[0] ? parseFloat(book2.asks[0].price) : 1
+            spread2 = bestAsk2 - bestBid2
+            bidDepth2 = (book2.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0)
+            askDepth2 = (book2.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0)
+          }
+        } catch { /* fallback */ }
+      }
 
       _totalAttempted++
-      if (Math.random() > fillProb2) {
+      const sharesWanted2 = betSize / price
+      let fillableShares2 = 0, fillPrice2 = price, isTaker2 = false
+
+      if (book2 && book2.asks && book2.asks.length > 0) {
+        let spent2 = 0, bought2 = 0
+        for (const level of book2.asks) {
+          const lp = parseFloat(level.price), ls = parseFloat(level.size)
+          if (lp > price * 1.03) break
+          const can = Math.min(ls, sharesWanted2 - bought2)
+          bought2 += can; spent2 += can * lp
+          if (bought2 >= sharesWanted2) break
+        }
+        fillableShares2 = bought2
+        fillPrice2 = bought2 > 0 ? spent2 / bought2 : price
+        isTaker2 = true
+      } else {
+        let fp = price < 0.70 ? 0.90 : price < 0.85 ? 0.75 : price < 0.92 ? 0.50 : price < 0.95 ? 0.30 : 0.15
+        if (Math.random() > fp) { _totalNoFills++; continue }
+        fillableShares2 = sharesWanted2
+      }
+
+      if (fillableShares2 < sharesWanted2 * 0.20) {
         _totalNoFills++
         continue
       }
 
-      let fillPct2 = 1.0
-      if (price >= 0.92) fillPct2 = 0.30 + Math.random() * 0.40
-      else if (price >= 0.80) fillPct2 = 0.60 + Math.random() * 0.40
+      let fillPct2 = Math.min(fillableShares2 / sharesWanted2, 1.0)
       if (fillPct2 < 0.99) _totalPartialFills++
       betSize = Math.max(2, Math.round(betSize * fillPct2 * 100) / 100)
 
-      let slipPct = price >= 0.92 ? 0.010 + Math.random() * 0.020
-                  : price >= 0.80 ? 0.005 + Math.random() * 0.010
-                  : 0.003 + Math.random() * 0.004
-      const slippedPrice = Math.min(price * (1 + slipPct), 0.995)
-      const slipCost = (slippedPrice - price) * (betSize / slippedPrice)
+      const slippedPrice = Math.min(fillPrice2, 0.995)
+      const slipCost = Math.max(0, (slippedPrice - price) * (betSize / slippedPrice))
 
-      const cat = smartBrain.detectCategory(pick.market.question || "")
       const takerRate = realTrader.TAKER_FEE_RATES[cat] || realTrader.TAKER_FEE_RATES.other
-      const takerChance2 = price >= 0.95 ? 0.70 : price >= 0.85 ? 0.50 : 0.30
       const entryShares = betSize / slippedPrice
       const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
+      const takerChance2 = isTaker2 ? (spread2 < 0.02 ? 0.70 : 0.40) : 0.30
       const entryFee = takerFee * takerChance2
 
       const effectiveBet = betSize - entryFee
@@ -1338,9 +1401,17 @@ async function runVirtualTradingCycle() {
         )
         _tradedMarkets.add(pick.market.id)
         tradesPlaced++
-        const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
-        const fillStr2 = fillPct2 < 1.0 ? ` fill:${(fillPct2 * 100).toFixed(0)}%` : ""
-        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr}${fillStr2})`)
+        const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
+        const fillStr2 = fillPct2 < 1.0 ? ` | fill: ${(fillPct2 * 100).toFixed(0)}%` : ""
+        const spreadStr2 = book2 ? `${(spread2 * 100).toFixed(2)}%` : "?"
+        const depthStr2 = book2 ? `B:$${(bidDepth2 * bestBid2).toFixed(0)} A:$${(askDepth2 * bestAsk2).toFixed(0)}` : "no book"
+        console.log(
+          `[BRAIN] ✅ ${(pick.outcome || "").slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
+          ` | $${betSize.toFixed(2)} → ${shares.toFixed(1)} shares` +
+          ` | ${pick.strategy}` +
+          ` | spread: ${spreadStr2} | book: ${depthStr2}` +
+          `${feeStr}${fillStr2}`
+        )
       } catch (err) {
         console.error(`[BRAIN] Trade failed:`, err.message)
       }
