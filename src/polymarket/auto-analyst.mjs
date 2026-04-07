@@ -667,29 +667,34 @@ async function autoVirtualTrade(scanResults) {
 
     // ── REAL ORDER BOOK EXECUTION ──
     // Fetch actual Polymarket order book to determine if we can fill
+    // NOTE: Polymarket CLOB has separate tokens for each outcome.
+    // The book prices are in the TOKEN's price space (0-1), NOT the probability space.
+    // For a "No" outcome at 95% probability, the No token trades at ~0.95 on its own book.
     const tokenId = pick.market?.outcomes?.find(o => o.name === outcome)?.tokenId
     const category = smartBrain.detectCategory(question)
 
-    let book = null, bestBid = 0, bestAsk = 1, spread = 0, bidDepth = 0, askDepth = 0
+    let book = null, bestBid = 0, bestAsk = 0, spread = 0, bidDepthUsd = 0, askDepthUsd = 0
     if (tokenId) {
       try {
         book = await scanner.getOrderBook(tokenId)
-        if (book) {
-          bestBid = book.bids?.[0] ? parseFloat(book.bids[0].price) : 0
-          bestAsk = book.asks?.[0] ? parseFloat(book.asks[0].price) : 1
+        if (book && book.asks?.length > 0 && book.bids?.length > 0) {
+          bestBid = parseFloat(book.bids[0].price)
+          bestAsk = parseFloat(book.asks[0].price)
           spread = bestAsk - bestBid
-          bidDepth = (book.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0)
-          askDepth = (book.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0)
+          // Depth in USD = shares × price at each level
+          bidDepthUsd = (book.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0) * parseFloat(b.price || 0), 0)
+          askDepthUsd = (book.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0) * parseFloat(a.price || 0), 0)
         }
       } catch { /* book fetch failed, use fallback */ }
     }
 
     _totalAttempted++
 
-    // If we got real book data, use it. Otherwise fallback to price-based estimates.
-    const sharesWanted = betSize / price
+    // Use the book's best ask as our actual entry price reference (not Gamma API mid)
+    const bookPrice = (bestAsk > 0 && bestAsk < 1) ? bestAsk : price
+    const sharesWanted = betSize / bookPrice
     let fillableShares = 0
-    let fillPrice = price
+    let fillPrice = bookPrice
     let isTaker = false
 
     if (book && book.asks && book.asks.length > 0) {
@@ -699,15 +704,15 @@ async function autoVirtualTrade(scanResults) {
       for (const level of book.asks) {
         const lvlPrice = parseFloat(level.price)
         const lvlSize = parseFloat(level.size)
-        if (lvlPrice > price * 1.03) break // Don't buy more than 3% above mid price
+        if (lvlPrice > bookPrice * 1.03) break // Don't buy more than 3% above best ask
         const canBuy = Math.min(lvlSize, sharesWanted - sharesBought)
         sharesBought += canBuy
         spent += canBuy * lvlPrice
         if (sharesBought >= sharesWanted) break
       }
       fillableShares = sharesBought
-      fillPrice = sharesBought > 0 ? spent / sharesBought : price
-      isTaker = true // Lifting asks = taker
+      fillPrice = sharesBought > 0 ? spent / sharesBought : bookPrice
+      isTaker = true
     } else {
       // No book data — use price-based fill probability
       let fillProb
@@ -730,8 +735,8 @@ async function autoVirtualTrade(scanResults) {
     // Check if enough liquidity exists
     if (fillableShares < sharesWanted * 0.20) {
       _totalNoFills++
-      const depthStr = book ? `ask depth: $${(askDepth * bestAsk).toFixed(0)} (${askDepth.toFixed(0)} shares)` : "no book"
-      console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — ${depthStr}, need ${sharesWanted.toFixed(0)} shares`)
+      const depthStr = book ? `ask depth: $${askDepthUsd.toFixed(0)} (${fillableShares.toFixed(0)}/${sharesWanted.toFixed(0)} shares)` : "no book"
+      console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — ${depthStr}`)
       continue
     }
 
@@ -740,17 +745,15 @@ async function autoVirtualTrade(scanResults) {
     if (fillPct < 0.99) _totalPartialFills++
     betSize = Math.max(2, Math.round(betSize * fillPct * 100) / 100)
 
-    // Real slippage = difference between mid price and actual fill price
+    // Real slippage = VWAP from walking book vs best ask
     const slippedPrice = Math.min(fillPrice, 0.995)
-    const slippageCost = Math.max(0, (slippedPrice - price) * (betSize / slippedPrice))
+    const slippageCost = Math.max(0, (slippedPrice - bookPrice) * (betSize / slippedPrice))
 
     // Entry fee: taker if we lift asks, maker if we place a limit below best ask
-    // With real book: if our order crosses the spread, we're taker
     const takerRate = realTrader.TAKER_FEE_RATES[category] || realTrader.TAKER_FEE_RATES.other
     const entryShares = betSize / slippedPrice
     const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
-    // If we're lifting asks = 100% taker. If we'd place limit = 0% taker.
-    // Realistic: we place at bestAsk or better — 50/50 chance of immediate fill (taker) vs queue (maker)
+    // Tight spread = more likely taker (our limit crosses), wide = more likely maker
     const takerChance = isTaker ? (spread < 0.02 ? 0.70 : 0.40) : 0.30
     const entryFee = takerFee * takerChance
 
@@ -779,14 +782,14 @@ async function autoVirtualTrade(scanResults) {
       // ── DETAILED TRADE LOG — like a real exchange ──
       const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
       const fillStr = fillPct < 1.0 ? ` | fill: ${(fillPct * 100).toFixed(0)}%` : ""
-      const spreadStr = book ? `${(spread * 100).toFixed(2)}%` : "?"
-      const depthStr = book ? `B:$${(bidDepth * bestBid).toFixed(0)} A:$${(askDepth * bestAsk).toFixed(0)}` : "no book"
+      const spreadStr = book ? `${(spread * 10000).toFixed(1)} bps` : "?"
+      const depthStr = book ? `bid:$${bidDepthUsd.toFixed(0)} ask:$${askDepthUsd.toFixed(0)}` : "no book"
       const slipStr = slippageCost > 0.001 ? ` | slip: $${slippageCost.toFixed(3)}` : ""
       console.log(
         `[VIRTUAL] ✅ ${outcome.slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
         ` | $${betSize.toFixed(2)} → ${shares.toFixed(1)} shares` +
         ` | ${pick.strategy}` +
-        ` | spread: ${spreadStr} | book: ${depthStr}` +
+        ` | spread: ${spreadStr} | ${depthStr}` +
         `${feeStr}${slipStr}${fillStr}`
       )
     } catch (err) {
@@ -1332,35 +1335,36 @@ async function runVirtualTradingCycle() {
       const tokenId2 = pick.market?.outcomes?.find(o => o.name === pick.outcome)?.tokenId
       const cat = smartBrain.detectCategory(pick.market.question || "")
 
-      let book2 = null, bestBid2 = 0, bestAsk2 = 1, spread2 = 0, bidDepth2 = 0, askDepth2 = 0
+      let book2 = null, bestBid2 = 0, bestAsk2 = 0, spread2 = 0, bidDepthUsd2 = 0, askDepthUsd2 = 0
       if (tokenId2) {
         try {
           book2 = await scanner.getOrderBook(tokenId2)
-          if (book2) {
-            bestBid2 = book2.bids?.[0] ? parseFloat(book2.bids[0].price) : 0
-            bestAsk2 = book2.asks?.[0] ? parseFloat(book2.asks[0].price) : 1
+          if (book2 && book2.asks?.length > 0 && book2.bids?.length > 0) {
+            bestBid2 = parseFloat(book2.bids[0].price)
+            bestAsk2 = parseFloat(book2.asks[0].price)
             spread2 = bestAsk2 - bestBid2
-            bidDepth2 = (book2.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0), 0)
-            askDepth2 = (book2.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0), 0)
+            bidDepthUsd2 = (book2.bids || []).slice(0, 5).reduce((s, b) => s + parseFloat(b.size || 0) * parseFloat(b.price || 0), 0)
+            askDepthUsd2 = (book2.asks || []).slice(0, 5).reduce((s, a) => s + parseFloat(a.size || 0) * parseFloat(a.price || 0), 0)
           }
         } catch { /* fallback */ }
       }
 
       _totalAttempted++
-      const sharesWanted2 = betSize / price
-      let fillableShares2 = 0, fillPrice2 = price, isTaker2 = false
+      const bookPrice2 = (bestAsk2 > 0 && bestAsk2 < 1) ? bestAsk2 : price
+      const sharesWanted2 = betSize / bookPrice2
+      let fillableShares2 = 0, fillPrice2 = bookPrice2, isTaker2 = false
 
       if (book2 && book2.asks && book2.asks.length > 0) {
         let spent2 = 0, bought2 = 0
         for (const level of book2.asks) {
           const lp = parseFloat(level.price), ls = parseFloat(level.size)
-          if (lp > price * 1.03) break
+          if (lp > bookPrice2 * 1.03) break
           const can = Math.min(ls, sharesWanted2 - bought2)
           bought2 += can; spent2 += can * lp
           if (bought2 >= sharesWanted2) break
         }
         fillableShares2 = bought2
-        fillPrice2 = bought2 > 0 ? spent2 / bought2 : price
+        fillPrice2 = bought2 > 0 ? spent2 / bought2 : bookPrice2
         isTaker2 = true
       } else {
         let fp = price < 0.70 ? 0.90 : price < 0.85 ? 0.75 : price < 0.92 ? 0.50 : price < 0.95 ? 0.30 : 0.15
@@ -1378,7 +1382,7 @@ async function runVirtualTradingCycle() {
       betSize = Math.max(2, Math.round(betSize * fillPct2 * 100) / 100)
 
       const slippedPrice = Math.min(fillPrice2, 0.995)
-      const slipCost = Math.max(0, (slippedPrice - price) * (betSize / slippedPrice))
+      const slipCost = Math.max(0, (slippedPrice - bookPrice2) * (betSize / slippedPrice))
 
       const takerRate = realTrader.TAKER_FEE_RATES[cat] || realTrader.TAKER_FEE_RATES.other
       const entryShares = betSize / slippedPrice
@@ -1403,13 +1407,13 @@ async function runVirtualTradingCycle() {
         tradesPlaced++
         const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
         const fillStr2 = fillPct2 < 1.0 ? ` | fill: ${(fillPct2 * 100).toFixed(0)}%` : ""
-        const spreadStr2 = book2 ? `${(spread2 * 100).toFixed(2)}%` : "?"
-        const depthStr2 = book2 ? `B:$${(bidDepth2 * bestBid2).toFixed(0)} A:$${(askDepth2 * bestAsk2).toFixed(0)}` : "no book"
+        const spreadStr2 = book2 ? `${(spread2 * 10000).toFixed(1)} bps` : "?"
+        const depthStr2 = book2 ? `bid:$${bidDepthUsd2.toFixed(0)} ask:$${askDepthUsd2.toFixed(0)}` : "no book"
         console.log(
           `[BRAIN] ✅ ${(pick.outcome || "").slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
           ` | $${betSize.toFixed(2)} → ${shares.toFixed(1)} shares` +
           ` | ${pick.strategy}` +
-          ` | spread: ${spreadStr2} | book: ${depthStr2}` +
+          ` | spread: ${spreadStr2} | ${depthStr2}` +
           `${feeStr}${fillStr2}`
         )
       } catch (err) {
