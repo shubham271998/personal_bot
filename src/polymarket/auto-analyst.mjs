@@ -531,11 +531,12 @@ try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN entry_fee REAL DE
 try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN exit_fee REAL DEFAULT 0`) } catch {}
 try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN category TEXT DEFAULT 'other'`) } catch {}
 try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN slippage REAL DEFAULT 0`) } catch {}
+try { db.raw.exec(`ALTER TABLE pm_virtual_portfolio ADD COLUMN fill_pct REAL DEFAULT 1.0`) } catch {}
 
 const virtualStmts = {
   openPosition: db.raw.prepare(`
-    INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, entry_fee, category, slippage)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, entry_fee, category, slippage, fill_pct)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getOpenPositions: db.raw.prepare(`SELECT * FROM pm_virtual_portfolio WHERE status = 'open'`),
   closePosition: db.raw.prepare(`
@@ -575,8 +576,13 @@ const virtualStmts = {
 }
 
 const VIRTUAL_STARTING_BANKROLL = 1000
-const VIRTUAL_MAX_BET = 35 // Raised from $25 — proven strategies deserve more capital
-const VIRTUAL_MAX_OPEN = 150 // 150 positions — spread across entire market
+const VIRTUAL_MAX_BET = 35
+const VIRTUAL_MAX_OPEN = 150
+
+// Track fill statistics for realistic reporting
+let _totalAttempted = 0
+let _totalNoFills = 0
+let _totalPartialFills = 0
 
 /**
  * Get current virtual bankroll (compounded from PnL)
@@ -682,7 +688,9 @@ async function autoVirtualTrade(scanResults) {
     else if (vol24h > 100000) fillProb = Math.min(fillProb * 1.15, 0.90)
 
     // Roll the dice — does this order fill?
+    _totalAttempted++
     if (Math.random() > fillProb) {
+      _totalNoFills++
       console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — order book too thin (${(fillProb * 100).toFixed(0)}% fill rate)`)
       continue
     }
@@ -692,6 +700,7 @@ async function autoVirtualTrade(scanResults) {
     let fillPct = 1.0
     if (price >= 0.92) fillPct = 0.30 + Math.random() * 0.40 // 30-70%
     else if (price >= 0.80) fillPct = 0.60 + Math.random() * 0.40 // 60-100%
+    if (fillPct < 0.99) _totalPartialFills++
     betSize = Math.max(2, Math.round(betSize * fillPct * 100) / 100)
 
     // Slippage: wider at extreme prices where books are thin
@@ -731,6 +740,7 @@ async function autoVirtualTrade(scanResults) {
         Math.round(entryFee * 10000) / 10000, // entry_fee
         category,
         Math.round(slippageCost * 10000) / 10000, // slippage
+        Math.round(fillPct * 100) / 100, // fill_pct
       )
       tradesPlaced++
       _tradedMarkets.add(marketId)
@@ -964,7 +974,7 @@ function generateScorecard() {
       ROUND(SUM(COALESCE(entry_fee,0) + COALESCE(exit_fee,0) + COALESCE(slippage,0)), 2) as total_fees,
       ROUND(SUM(size_usdc), 2) as volume,
       ROUND(AVG(pnl), 2) as avg_pnl
-    FROM pm_virtual_portfolio WHERE strategy != 'v2-fee-reset'
+    FROM pm_virtual_portfolio WHERE strategy NOT IN ('v2-fee-reset', 'system')
     GROUP BY strategy ORDER BY total_pnl DESC
   `).all()
 
@@ -1013,11 +1023,31 @@ function generateScorecard() {
   const slipF = feeBreakdown?.total_slippage || 0
   const totalCost = entryF + exitF + slipF
 
+  // ── Execution realism stats ──
+  const fillStats = db.raw.prepare(`
+    SELECT COUNT(*) as filled,
+      ROUND(AVG(fill_pct), 2) as avg_fill,
+      SUM(CASE WHEN fill_pct < 1.0 THEN 1 ELSE 0 END) as partial_fills
+    FROM pm_virtual_portfolio WHERE close_reason != 'v3-full-reset'
+  `).get()
+
+  const upsetCount = db.raw.prepare(
+    `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio WHERE close_reason = 'snipe-upset'`
+  ).get()?.cnt || 0
+
   let feeText = `\n*Fee Breakdown:*\n`
   feeText += `  Entry (maker/taker mix): $${entryF.toFixed(2)}\n`
   feeText += `  Exit (taker on sells): $${exitF.toFixed(2)}\n`
   feeText += `  Slippage: $${slipF.toFixed(2)}\n`
   feeText += `  *Total cost:* $${totalCost.toFixed(2)}\n`
+
+  // ── Realism report ──
+  const fillRate = _totalAttempted > 0 ? ((_totalAttempted - _totalNoFills) / _totalAttempted * 100) : 0
+  let realismText = `\n*Execution Realism:*\n`
+  realismText += `  Orders attempted: ${_totalAttempted} | Filled: ${_totalAttempted - _totalNoFills} (${fillRate.toFixed(0)}%)\n`
+  realismText += `  No fills (book too thin): ${_totalNoFills}\n`
+  realismText += `  Partial fills: ${_totalPartialFills} | Avg fill: ${((fillStats?.avg_fill || 1) * 100).toFixed(0)}%\n`
+  realismText += `  Snipe upsets (resolved against): ${upsetCount}\n`
 
   // ── Open positions detail ──
   let posText = ""
@@ -1053,9 +1083,9 @@ function generateScorecard() {
     `*Best:* +$${(pnl?.best_trade || 0).toFixed(2)} | *Worst:* $${(pnl?.worst_trade || 0).toFixed(2)} | *Avg:* $${(pnl?.total_trades > 0 ? totalPnL / pnl.total_trades : 0).toFixed(2)}/trade\n` +
     `*Volume:* $${(pnl?.total_volume || 0).toFixed(2)}\n` +
     `*Rating:* ${rating}\n` +
-    stratText + catText + feeText + posText +
+    stratText + catText + feeText + realismText + posText +
     `\n*Capital:* $${(currentBalance - openValue).toFixed(2)} free / $${openValue.toFixed(2)} invested\n` +
-    `_Simulating real fees — what you see is what you'd get_`
+    `_Full realistic simulation — fills, slippage, fees, upsets. What you see = what real $1000 would do._`
 }
 
 /**
@@ -1088,126 +1118,41 @@ export function startAutonomous() {
   if (_isRunning) return false
   _isRunning = true
 
-  // ── ONE-TIME RESET: close all old positions, start fresh with fee formula ──
-  // Remove this block after first deploy (or leave — it's idempotent)
+  // ── ONE-TIME V3 RESET: wipe all old data, start fresh with realistic simulation ──
+  // Idempotent: checks for v3-reset marker
   try {
-    const oldOpen = virtualStmts.getOpenPositions.all()
-    if (oldOpen.length > 0) {
-      // Check if any position was opened AFTER this deploy (has category set to non-default)
-      // Old positions have category=NULL or 'other' default, new ones have real categories
-      const hasNewFormula = oldOpen.some((p) => p.category && p.category !== "other" && p.slippage > 0)
-      if (!hasNewFormula) {
-        // All old positions — close them at entry price (0 P&L) to start fresh
-        db.raw.prepare(`
-          UPDATE pm_virtual_portfolio
-          SET status='closed', exit_price=entry_price, pnl=0, close_reason='v2-fee-reset', exit_fee=0, closed_at=datetime('now')
-          WHERE status='open'
-        `).run()
-        _tradedMarkets.clear()
-        console.log(`[AUTO-ANALYST] ✅ Reset ${oldOpen.length} old positions — starting fresh with fee formula`)
-      } else {
-        // New formula positions exist — just load dedup set normally
-        const positions = virtualStmts.getOpenPositions.all()
-        for (const pos of positions) {
-          if (pos.market_id) _tradedMarkets.add(pos.market_id)
-        }
+    const v3Marker = db.raw.prepare(
+      `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio WHERE close_reason = 'v3-full-reset'`
+    ).get()
+    const oldCount = db.raw.prepare(`SELECT COUNT(*) as cnt FROM pm_virtual_portfolio`).get()
+
+    if (v3Marker.cnt === 0 && oldCount.cnt > 0) {
+      // Wipe everything — old data is unrealistic (no fill simulation, no upsets)
+      db.raw.exec(`DELETE FROM pm_virtual_portfolio`)
+      db.raw.exec(`DELETE FROM pm_virtual_stats`)
+      // Insert a marker so this never runs again
+      db.raw.prepare(
+        `INSERT INTO pm_virtual_portfolio (market_id, market_question, outcome, side, entry_price, shares, size_usdc, strategy, status, pnl, close_reason, closed_at)
+         VALUES ('v3-reset', 'Virtual trading reset — realistic simulation v3', 'RESET', 'NONE', 0, 0, 0, 'system', 'closed', 0, 'v3-full-reset', datetime('now'))`
+      ).run()
+      _tradedMarkets.clear()
+      console.log(`[AUTO-ANALYST] 🔄 V3 FULL RESET — wiped ${oldCount.cnt} old trades. Starting fresh with $${VIRTUAL_STARTING_BANKROLL} and realistic simulation`)
+      console.log(`[AUTO-ANALYST]    Fill probability, partial fills, upset simulation, realistic slippage all active`)
+    } else {
+      // Load existing positions into dedup set
+      const positions = virtualStmts.getOpenPositions.all()
+      for (const pos of positions) {
+        if (pos.market_id) _tradedMarkets.add(pos.market_id)
+      }
+      if (positions.length > 0) {
         console.log(`[AUTO-ANALYST] Loaded ${positions.length} open positions into dedup set`)
       }
     }
   } catch (err) {
-    console.error(`[AUTO-ANALYST] Reset error: ${err.message}`)
+    console.error(`[AUTO-ANALYST] V3 reset error: ${err.message}`)
   }
 
-  // ── ONE-TIME BACKFILL: estimate fees for old trades that had none ──
-  // Idempotent: checks if backfill already ran by looking for the marker
-  try {
-    const backfillMarker = db.raw.prepare(
-      `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio WHERE close_reason LIKE '%fee-backfill-applied%'`
-    ).get()
-
-    const needsBackfill = db.raw.prepare(
-      `SELECT COUNT(*) as cnt FROM pm_virtual_portfolio
-       WHERE status='closed' AND COALESCE(entry_fee,0)=0 AND COALESCE(slippage,0)=0
-       AND COALESCE(close_reason,'') NOT LIKE '%v2-fee-reset%'
-       AND COALESCE(close_reason,'') NOT LIKE '%fee-backfill-applied%'`
-    ).get()
-
-    if (backfillMarker.cnt === 0 && needsBackfill.cnt > 0) {
-      console.log(`[AUTO-ANALYST] ⏳ Backfilling fees for ${needsBackfill.cnt} old trades...`)
-
-      const oldTrades = db.raw.prepare(
-        `SELECT id, entry_price, exit_price, shares, size_usdc, pnl, close_reason, strategy, market_question
-         FROM pm_virtual_portfolio
-         WHERE status='closed' AND COALESCE(entry_fee,0)=0 AND COALESCE(slippage,0)=0
-         AND COALESCE(close_reason,'') NOT LIKE '%v2-fee-reset%'
-         AND COALESCE(close_reason,'') NOT LIKE '%fee-backfill-applied%'`
-      ).all()
-
-      const updateStmt = db.raw.prepare(
-        `UPDATE pm_virtual_portfolio
-         SET entry_fee=?, exit_fee=?, slippage=?, pnl=?,
-             close_reason = CASE
-               WHEN close_reason IS NULL OR close_reason = '' THEN 'fee-backfill-applied'
-               ELSE close_reason || ' fee-backfill-applied'
-             END
-         WHERE id=?`
-      )
-
-      let totalBackfilledFees = 0
-      const batchUpdate = db.raw.transaction(() => {
-        for (const t of oldTrades) {
-          const price = t.entry_price || 0.5
-          const size = t.size_usdc || 0
-
-          // 1. Estimate slippage: avg 0.75% of entry price (midpoint of 0.5-1%)
-          const slippagePct = 0.0075
-          const slippedPrice = Math.min(price * (1 + slippagePct), 0.99)
-          const slippageCost = (slippedPrice - price) * (size / slippedPrice)
-
-          // 2. Estimate entry fee: 30% taker chance, "other" category (1.25%) since old trades have no category
-          const takerRate = realTrader.TAKER_FEE_RATES.other
-          const entryShares = size / slippedPrice
-          const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
-          const entryFee = takerFee * 0.3
-
-          // 3. Estimate exit fee: free for resolution wins, taker fee for early exits
-          let exitFee = 0
-          const reason = (t.close_reason || "").toLowerCase()
-          const isResolution = reason.includes("resolved") || reason.includes("snipe") || reason.includes("expired") || reason === ""
-          if (!isResolution && t.exit_price && t.exit_price < 0.98) {
-            // Early exit (stop-loss, take-profit, stale) = taker sell fee
-            const exitCalc = realTrader.calculateTakerFee((t.shares || 0) * t.exit_price, t.exit_price, "other")
-            exitFee = exitCalc.fee
-          }
-
-          const totalFee = Math.round((entryFee + exitFee + slippageCost) * 10000) / 10000
-          const newPnl = (t.pnl || 0) - entryFee - exitFee - slippageCost
-          totalBackfilledFees += totalFee
-
-          updateStmt.run(
-            Math.round(entryFee * 10000) / 10000,
-            Math.round(exitFee * 10000) / 10000,
-            Math.round(slippageCost * 10000) / 10000,
-            Math.round(newPnl * 10000) / 10000,
-            t.id
-          )
-        }
-      })
-      batchUpdate()
-
-      console.log(`[AUTO-ANALYST] ✅ Backfilled fees on ${oldTrades.length} trades — total deducted: $${totalBackfilledFees.toFixed(2)}`)
-
-      // Log impact on balance
-      const newPnl = db.raw.prepare(`SELECT COALESCE(SUM(pnl),0) as p FROM pm_virtual_portfolio WHERE status='closed'`).get()
-      console.log(`[AUTO-ANALYST] 💰 New net P&L after backfill: $${newPnl.p.toFixed(2)} (balance: $${(VIRTUAL_STARTING_BANKROLL + newPnl.p).toFixed(2)})`)
-    } else if (backfillMarker.cnt > 0) {
-      console.log(`[AUTO-ANALYST] Fee backfill already applied (${backfillMarker.cnt} trades marked)`)
-    }
-  } catch (err) {
-    console.error(`[AUTO-ANALYST] Fee backfill error: ${err.message}`)
-  }
-
-  console.log("[AUTO-ANALYST] Started autonomous mode with virtual trading")
+  console.log("[AUTO-ANALYST] Started autonomous mode with realistic virtual trading (v3)")
 
   // Initial briefing after 2 minutes (let everything warm up)
   setTimeout(() => sendBriefing(), 2 * 60 * 1000)
@@ -1341,16 +1286,42 @@ async function runVirtualTradingCycle() {
       const betSize = Math.min(pick.betSize || 5, VIRTUAL_MAX_BET)
       if (betSize < 3 || currentBalance - (virtualStmts.getOpenValue.get()?.total_invested || 0) < betSize) continue
 
-      // ── REALISTIC EXECUTION: slippage + fees ──
-      const slipPct = 0.005 + Math.random() * 0.005
-      const slippedPrice = Math.min(price * (1 + slipPct), 0.99)
+      // ── REALISTIC EXECUTION: fill probability + slippage + fees ──
+      let fillProb2
+      if (price < 0.70) fillProb2 = 0.90
+      else if (price < 0.85) fillProb2 = 0.75
+      else if (price < 0.92) fillProb2 = 0.50
+      else if (price < 0.95) fillProb2 = 0.30
+      else fillProb2 = 0.15
+
+      const vol24h2 = pick.market?.volume24hr || 0
+      if (vol24h2 > 500000) fillProb2 = Math.min(fillProb2 * 1.3, 0.95)
+      else if (vol24h2 > 100000) fillProb2 = Math.min(fillProb2 * 1.15, 0.90)
+
+      _totalAttempted++
+      if (Math.random() > fillProb2) {
+        _totalNoFills++
+        continue
+      }
+
+      let fillPct2 = 1.0
+      if (price >= 0.92) fillPct2 = 0.30 + Math.random() * 0.40
+      else if (price >= 0.80) fillPct2 = 0.60 + Math.random() * 0.40
+      if (fillPct2 < 0.99) _totalPartialFills++
+      betSize = Math.max(2, Math.round(betSize * fillPct2 * 100) / 100)
+
+      let slipPct = price >= 0.92 ? 0.010 + Math.random() * 0.020
+                  : price >= 0.80 ? 0.005 + Math.random() * 0.010
+                  : 0.003 + Math.random() * 0.004
+      const slippedPrice = Math.min(price * (1 + slipPct), 0.995)
       const slipCost = (slippedPrice - price) * (betSize / slippedPrice)
 
       const cat = smartBrain.detectCategory(pick.market.question || "")
       const takerRate = realTrader.TAKER_FEE_RATES[cat] || realTrader.TAKER_FEE_RATES.other
+      const takerChance2 = price >= 0.95 ? 0.70 : price >= 0.85 ? 0.50 : 0.30
       const entryShares = betSize / slippedPrice
       const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
-      const entryFee = takerFee * 0.3 // 70% maker / 30% taker mix
+      const entryFee = takerFee * takerChance2
 
       const effectiveBet = betSize - entryFee
       const shares = effectiveBet / slippedPrice
@@ -1363,11 +1334,13 @@ async function runVirtualTradingCycle() {
           Math.round(entryFee * 10000) / 10000,
           cat,
           Math.round(slipCost * 10000) / 10000,
+          Math.round(fillPct2 * 100) / 100,
         )
         _tradedMarkets.add(pick.market.id)
         tradesPlaced++
         const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
-        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr})`)
+        const fillStr2 = fillPct2 < 1.0 ? ` fill:${(fillPct2 * 100).toFixed(0)}%` : ""
+        console.log(`[BRAIN] Traded: ${(pick.outcome || "").slice(0, 25)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr}${fillStr2})`)
       } catch (err) {
         console.error(`[BRAIN] Trade failed:`, err.message)
       }
