@@ -782,8 +782,8 @@ async function autoVirtualTrade(scanResults) {
       // ── DETAILED TRADE LOG — like a real exchange ──
       const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
       const fillStr = fillPct < 1.0 ? ` | fill: ${(fillPct * 100).toFixed(0)}%` : ""
-      const spreadStr = book ? `${(spread * 10000).toFixed(1)} bps` : "?"
-      const depthStr = book ? `bid:$${bidDepthUsd.toFixed(0)} ask:$${askDepthUsd.toFixed(0)}` : "no book"
+      const spreadStr = book ? `${bestBid.toFixed(3)}/${bestAsk.toFixed(3)}` : "?"
+      const depthStr = book ? `liq:$${Math.min(bidDepthUsd, askDepthUsd).toFixed(0)}` : "no book"
       const slipStr = slippageCost > 0.001 ? ` | slip: $${slippageCost.toFixed(3)}` : ""
       console.log(
         `[VIRTUAL] ✅ ${outcome.slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
@@ -1407,8 +1407,8 @@ async function runVirtualTradingCycle() {
         tradesPlaced++
         const feeStr = entryFee > 0.001 ? ` | fee: $${entryFee.toFixed(3)}` : ""
         const fillStr2 = fillPct2 < 1.0 ? ` | fill: ${(fillPct2 * 100).toFixed(0)}%` : ""
-        const spreadStr2 = book2 ? `${(spread2 * 10000).toFixed(1)} bps` : "?"
-        const depthStr2 = book2 ? `bid:$${bidDepthUsd2.toFixed(0)} ask:$${askDepthUsd2.toFixed(0)}` : "no book"
+        const spreadStr2 = book2 ? `${bestBid2.toFixed(3)}/${bestAsk2.toFixed(3)}` : "?"
+        const depthStr2 = book2 ? `liq:$${Math.min(bidDepthUsd2, askDepthUsd2).toFixed(0)}` : "no book"
         console.log(
           `[BRAIN] ✅ ${(pick.outcome || "").slice(0, 22)} @ ${(slippedPrice * 100).toFixed(2)}%` +
           ` | $${betSize.toFixed(2)} → ${shares.toFixed(1)} shares` +
