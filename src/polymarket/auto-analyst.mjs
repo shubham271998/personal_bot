@@ -659,20 +659,60 @@ async function autoVirtualTrade(scanResults) {
     const question = pick.market?.question || pick.event?.title || ""
     if (!marketId) continue
 
-    // ── REALISTIC EXECUTION: slippage + fees ──
-    // Simulate spread slippage: buying costs ~0.5-1% more than mid price
-    const slippagePct = 0.005 + Math.random() * 0.005 // 0.5-1% slippage
-    const slippedPrice = Math.min(price * (1 + slippagePct), 0.99)
+    // ── REALISTIC EXECUTION: fill probability + slippage + fees ──
+    // Real Polymarket order books are thin at extreme prices. Simulate realistic fills.
+
+    // Fill probability: at 50% price ~95% chance of fill, at 95%+ price drops sharply
+    // Based on real Polymarket order book depth analysis:
+    //   50-70%: ~90% fill rate (decent liquidity)
+    //   70-85%: ~75% fill rate (moderate)
+    //   85-92%: ~50% fill rate (thin books, many competing makers)
+    //   92-95%: ~30% fill rate (very thin, crowded)
+    //   95-99%: ~15% fill rate (nearly empty books, everyone racing)
+    let fillProb
+    if (price < 0.70) fillProb = 0.90
+    else if (price < 0.85) fillProb = 0.75
+    else if (price < 0.92) fillProb = 0.50
+    else if (price < 0.95) fillProb = 0.30
+    else fillProb = 0.15
+
+    // Boost fill probability for high-volume markets (more liquidity)
+    const vol24h = pick.market?.volume24hr || 0
+    if (vol24h > 500000) fillProb = Math.min(fillProb * 1.3, 0.95)
+    else if (vol24h > 100000) fillProb = Math.min(fillProb * 1.15, 0.90)
+
+    // Roll the dice — does this order fill?
+    if (Math.random() > fillProb) {
+      console.log(`[VIRTUAL] ❌ No fill: ${outcome.slice(0, 25)} @ ${(price * 100).toFixed(1)}% — order book too thin (${(fillProb * 100).toFixed(0)}% fill rate)`)
+      continue
+    }
+
+    // Partial fills: at extreme prices you rarely get full size
+    // 50-80%: full fill, 80-92%: 60-100%, 92%+: 30-70%
+    let fillPct = 1.0
+    if (price >= 0.92) fillPct = 0.30 + Math.random() * 0.40 // 30-70%
+    else if (price >= 0.80) fillPct = 0.60 + Math.random() * 0.40 // 60-100%
+    betSize = Math.max(2, Math.round(betSize * fillPct * 100) / 100)
+
+    // Slippage: wider at extreme prices where books are thin
+    // 50-80%: 0.3-0.7%, 80-92%: 0.5-1.5%, 92%+: 1-3%
+    let slippagePct
+    if (price < 0.80) slippagePct = 0.003 + Math.random() * 0.004
+    else if (price < 0.92) slippagePct = 0.005 + Math.random() * 0.010
+    else slippagePct = 0.010 + Math.random() * 0.020
+
+    const slippedPrice = Math.min(price * (1 + slippagePct), 0.995)
     const slippageCost = (slippedPrice - price) * (betSize / slippedPrice)
 
-    // Entry fee: maker limit order = 0%, but simulate realistic execution
-    // Most of our orders will be limit (maker = 0%), with some taker fills
-    // Assume 70% maker / 30% taker mix for realistic simulation
+    // Entry fee: maker = 0%, taker = category rate
+    // Real execution: at extreme prices you're more likely taker (competing for scarce shares)
+    // 50-85%: 30% taker, 85-95%: 50% taker, 95%+: 70% taker
     const category = smartBrain.detectCategory(question)
     const takerRate = realTrader.TAKER_FEE_RATES[category] || realTrader.TAKER_FEE_RATES.other
+    const takerChance = price >= 0.95 ? 0.70 : price >= 0.85 ? 0.50 : 0.30
     const entryShares = betSize / slippedPrice
     const takerFee = entryShares * takerRate * slippedPrice * (1 - slippedPrice)
-    const entryFee = takerFee * 0.3 // 30% chance of taker fill, 70% maker (free)
+    const entryFee = takerFee * takerChance
 
     // Net: deduct slippage + entry fee from effective position
     const effectiveBet = betSize - entryFee
@@ -695,7 +735,8 @@ async function autoVirtualTrade(scanResults) {
       tradesPlaced++
       _tradedMarkets.add(marketId)
       const feeStr = entryFee > 0.01 ? ` fee:$${entryFee.toFixed(2)}` : ""
-      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr})`)
+      const fillStr = fillPct < 1.0 ? ` fill:${(fillPct * 100).toFixed(0)}%` : ""
+      console.log(`[VIRTUAL] Traded: ${outcome.slice(0, 30)} @ ${(slippedPrice * 100).toFixed(1)}% — $${betSize.toFixed(2)} (${pick.strategy}${feeStr}${fillStr})`)
     } catch (err) {
       console.error(`[VIRTUAL] Trade failed:`, err.message)
     }
@@ -747,12 +788,24 @@ async function checkVirtualPositions() {
         }
       }
 
-      // 2. Resolution snipe: price near 100% or market closed
+      // 2. Resolution snipe: simulate realistic resolution outcomes
+      // The market price IS the probability — a 95% market fails 5% of the time
       if (!shouldClose && pos.strategy === "Resolution Snipe") {
         if (currentPrice >= 0.98) {
-          currentPrice = 1.0
-          shouldClose = true
-          closeReason = "snipe-won"
+          // Market at 98%+ — very likely to resolve in our favor, but not guaranteed
+          // Use entry price as the true probability (that's what the market said when we bought)
+          // Add small bonus: if price moved from 95% to 99%, market is more certain now
+          const resolveProb = Math.min(currentPrice, 0.99) // Use current price as probability
+          if (Math.random() < resolveProb) {
+            currentPrice = 1.0
+            shouldClose = true
+            closeReason = "snipe-won"
+          } else {
+            // The unlikely happened — market resolved against us
+            currentPrice = 0.0
+            shouldClose = true
+            closeReason = "snipe-upset"
+          }
         } else if (currentPrice < pos.entry_price * 0.93) {
           // Snipe went wrong — tighter stop for snipes (7% loss max)
           shouldClose = true
@@ -834,7 +887,7 @@ async function checkVirtualPositions() {
         // Resolution (market resolves YES/NO) = FREE settlement
         // Early exit (stop-loss, take-profit, stale) = taker fee to sell
         let exitFee = 0
-        if (closeReason !== "resolved" && closeReason !== "snipe-won" && closeReason !== "expired-worthless") {
+        if (closeReason !== "resolved" && closeReason !== "snipe-won" && closeReason !== "snipe-upset" && closeReason !== "expired-worthless") {
           const cat = pos.category || smartBrain.detectCategory(pos.market_question || "")
           const exitFeeCalc = realTrader.calculateTakerFee(pos.shares * currentPrice, currentPrice, cat)
           exitFee = exitFeeCalc.fee
